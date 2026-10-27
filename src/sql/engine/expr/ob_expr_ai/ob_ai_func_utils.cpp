@@ -229,10 +229,13 @@ int ObOpenAIUtils::ObOpenAIEmbed::parse_output(common::ObIAllocator &allocator,
     if (OB_FAIL(ObAIFuncJsonUtils::get_json_array(allocator, result_array))) {
     } else if (OB_ISNULL(data_node = http_response->get_value("data"))) {
       ret = OB_INVALID_DATA;
+    } else if (data_node->json_type() != ObJsonNodeType::J_ARRAY) {
+      ret = OB_INVALID_DATA;
     } else {
       ObJsonArray *data_array = static_cast<ObJsonArray *>(data_node);
       ObJsonNode *embedding_node = nullptr;
-      for (int64_t i = 0; OB_SUCC(ret) && i < data_array->element_count(); i++) {
+      int64_t count = data_array->element_count();
+      for (int64_t i = 0; OB_SUCC(ret) && i < count; i++) {
         if (OB_ISNULL(embedding_node = data_array->get_value(i))) {
           ret = OB_INVALID_DATA;
         } else if (embedding_node->json_type() != ObJsonNodeType::J_OBJECT) {
@@ -242,7 +245,24 @@ int ObOpenAIUtils::ObOpenAIEmbed::parse_output(common::ObIAllocator &allocator,
           ObJsonNode *embedding = embedding_obj->get_value("embedding");
           if (OB_ISNULL(embedding)) {
             ret = OB_INVALID_DATA;
-          } else if (OB_FAIL(result_array->append(embedding))) {
+          } else {
+            // The OpenAI embeddings API numbers each result via `data[i].index`.
+            // Responses may arrive out of order, so recover the original order
+            // instead of relying on the array position.
+            ObJsonNode *index_node = embedding_obj->get_value("index");
+            int64_t index = i;
+            if (OB_NOT_NULL(index_node)) {
+              if (index_node->json_type() != ObJsonNodeType::J_INT) {
+                ret = OB_INVALID_DATA;
+              } else {
+                index = static_cast<ObJsonInt *>(index_node)->get_int();
+              }
+            }
+            if (OB_FAIL(ret)) {
+            } else if (index < 0 || index >= count) {
+              ret = OB_INVALID_DATA;
+            } else if (OB_FAIL(result_array->insert(static_cast<uint64_t>(index), embedding))) {
+            }
           }
         }
       }
@@ -1629,6 +1649,17 @@ int ObAIFuncPromptObjectUtils::replace_all_str_args_in_template(ObIAllocator &al
       if (OB_NOT_NULL(arg_node) && arg_node->json_type() == ObJsonNodeType::J_STRING) {
         ObJsonString *arg_str = static_cast<ObJsonString *>(arg_node);
         max_result_len += arg_str->get_str().length();
+      } else if (OB_NOT_NULL(arg_node) && arg_node->json_type() == ObJsonNodeType::J_OBJECT) {
+        ObString nested_str;
+        ObJsonObject *nested_obj = static_cast<ObJsonObject *>(arg_node);
+        if (is_valid_prompt_object(nested_obj)) {
+          if (OB_FAIL(replace_all_str_args_in_template(allocator, nested_obj, nested_str))) {
+          }
+        } else if (OB_FAIL(ObAIFuncJsonUtils::print_json_to_str(allocator, arg_node, nested_str))) {
+        }
+        if (OB_SUCC(ret)) {
+          max_result_len += nested_str.length();
+        }
       } else {
         ret = OB_INVALID_ARGUMENT;
       }
@@ -1681,6 +1712,22 @@ int ObAIFuncPromptObjectUtils::replace_all_str_args_in_template(ObIAllocator &al
                   result_pos += arg_value.length();
                 } else {
                   ret = OB_BUF_NOT_ENOUGH;
+                }
+              } else if (OB_NOT_NULL(arg_node) && arg_node->json_type() == ObJsonNodeType::J_OBJECT) {
+                ObString nested_str;
+                ObJsonObject *nested_obj = static_cast<ObJsonObject *>(arg_node);
+                if (is_valid_prompt_object(nested_obj)) {
+                  if (OB_FAIL(replace_all_str_args_in_template(allocator, nested_obj, nested_str))) {
+                  }
+                } else if (OB_FAIL(ObAIFuncJsonUtils::print_json_to_str(allocator, arg_node, nested_str))) {
+                }
+                if (OB_SUCC(ret)) {
+                  if (result_pos + nested_str.length() <= max_result_len) {
+                    MEMCPY(result_buf + result_pos, nested_str.ptr(), nested_str.length());
+                    result_pos += nested_str.length();
+                  } else {
+                    ret = OB_BUF_NOT_ENOUGH;
+                  }
                 }
               } else {
                 //do nothing

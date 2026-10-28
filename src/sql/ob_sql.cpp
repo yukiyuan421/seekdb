@@ -190,12 +190,8 @@ int ObSql::stmt_query(const common::ObString &stmt, ObSqlCtx &context, ObResultS
 #endif
   NG_TRACE(parse_begin);
   //1 check inited
-  ObString file_sql_stmt;
   if (OB_FAIL(sanity_check(context))) {
-  } else if (OB_FAIL(ObFileSqlRewriter::rewrite(stmt, result.get_session(),
-                                                result.get_mem_pool(), file_sql_stmt))) {
-  } else if (OB_FAIL(handle_text_query(file_sql_stmt.empty() ? stmt : file_sql_stmt,
-                                       context, result))) {
+  } else if (OB_FAIL(handle_text_query(stmt, context, result))) {
     if (OB_EAGAIN != ret) {
     }
   }
@@ -1953,7 +1949,20 @@ OB_INLINE int ObSql::handle_text_query(const ObString &stmt, ObSqlCtx &context, 
 
   ObIAllocator &allocator = THIS_WORKER.get_sql_arena_allocator();
   ObSQLSessionInfo &session = result.get_session();
-  
+
+  ObString file_sql_stmt;
+  if (OB_FAIL(ret)) {
+  } else if (OB_FAIL(ObFileSqlRewriter::rewrite(trimed_stmt, session, allocator,
+                                                file_sql_stmt))) {
+    if (OB_NOT_SUPPORTED == ret || OB_ERR_PARSE_SQL == ret) {
+      // File SQL feature/parse errors must keep the connection alive so the
+      // test harness can continue with the next statement in the same session.
+      result.get_exec_context().set_need_disconnect(false);
+    }
+  } else if (!file_sql_stmt.empty()) {
+    trimed_stmt = file_sql_stmt;
+  }
+
   ObExecContext& ectx = result.get_exec_context();
   int get_plan_err = OB_SUCCESS; //used for judge whether add plan to plan cache
   bool use_plan_cache = session.get_local_ob_enable_plan_cache();

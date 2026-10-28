@@ -74,25 +74,37 @@ void ObStopWordChecker::destroy()
 int ObStopWordChecker::check_stopword(const ObFTWord &word, bool &is_stopword)
 {
   int ret = OB_SUCCESS;
-  
-  
-  common::ObArenaAllocator allocator(lib::ObMemAttr("ChkStopWord"));
+
   if (OB_UNLIKELY(!inited_)) {
     ret = OB_NOT_INIT;
   } else if (OB_UNLIKELY(word.empty())) {
     ret = OB_INVALID_ARGUMENT;
   } else {
-    common::ObString cmp_str;
-    // do nothing set out with in if type is the same.
-    if (OB_FAIL(common::ObCharset::charset_convert(
+    const ObString cmp_word = word.get_word().get_string();
+    ObFTWord lookup_word;
+    if (ObCharset::charset_type_by_coll(word.get_collation_type())
+        == ObCharset::charset_type_by_coll(stopword_type_.get_collation_type())) {
+      // Same character set: the conversion below would only be a byte-wise copy,
+      // so build the lookup key directly and skip the per-token conversion cost.
+      lookup_word = ObFTWord(cmp_word.length(), cmp_word.ptr(), stopword_type_);
+    } else {
+      common::ObArenaAllocator allocator(lib::ObMemAttr("ChkStopWord"));
+      common::ObString converted;
+      if (OB_FAIL(common::ObCharset::charset_convert(
                                        allocator,
-                                       word.get_word().get_string(),
+                                       cmp_word,
                                        word.get_collation_type(),
                                        stopword_type_.get_collation_type(),
-                                       cmp_str))) {
+                                       converted))) {
+      } else {
+        lookup_word = ObFTWord(converted.length(), converted.ptr(), stopword_type_);
+      }
+    }
+    if (OB_FAIL(ret)) {
+    } else if (OB_UNLIKELY(lookup_word.empty())) {
+      ret = OB_INVALID_ARGUMENT;
     } else {
-      ObFTWord converted(cmp_str.length(), cmp_str.ptr(), stopword_type_);
-      ret = stopword_set_.exist_refactored(converted);
+      ret = stopword_set_.exist_refactored(lookup_word);
       if (OB_HASH_NOT_EXIST == ret) {
         is_stopword = false;
         ret = OB_SUCCESS;
@@ -158,21 +170,40 @@ bool ObAddWord::is_min_max_word(const int64_t c_len) const
   return flag_.min_max_word() && (c_len < min_token_size_ || c_len > max_token_size_);
 }
 
+static inline bool is_ascii_without_upper(const ObString &word)
+{
+  const unsigned char *ptr = reinterpret_cast<const unsigned char *>(word.ptr());
+  bool has_upper = false;
+  for (int64_t i = 0; !has_upper && i < word.length(); ++i) {
+    if (ptr[i] >= 0x80 || (ptr[i] >= 'A' && ptr[i] <= 'Z')) {
+      has_upper = true;
+    }
+  }
+  return !has_upper;
+}
+
 int ObAddWord::casedown_word(const ObFTWord &src, ObFTWord &dst)
 {
   int ret = OB_SUCCESS;
   if (OB_UNLIKELY(src.empty())) {
     ret = OB_INVALID_ARGUMENT;
   } else if (flag_.casedown()) {
-    ObString dst_str;
-    if (OB_FAIL(ObCharset::tolower(
-                    word_meta_.get_collation_type(),
-                    src.get_word().get_string(),
-                    dst_str,
-                    allocator_))) {
+    const ObString src_str = src.get_word().get_string();
+    if (is_ascii_without_upper(src_str)) {
+      // Nothing to fold: reuse the source word instead of allocating and copying
+      // a lower-cased copy for every token.
+      dst = src;
     } else {
-      ObFTWord tmp(dst_str.length(), dst_str.ptr(), word_meta_);
-      dst = tmp;
+      ObString dst_str;
+      if (OB_FAIL(ObCharset::tolower(
+                      word_meta_.get_collation_type(),
+                      src_str,
+                      dst_str,
+                      allocator_))) {
+      } else {
+        ObFTWord tmp(dst_str.length(), dst_str.ptr(), word_meta_);
+        dst = tmp;
+      }
     }
   } else {
     dst = src;

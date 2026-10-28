@@ -578,7 +578,7 @@ static int load_csv(const std::string &path, const FileCsvOptions &opt, FileTabl
   int64_t bad_line = 0;
   if (OB_FAIL(read_file_bytes(path, data))) {
   } else if (OB_FAIL(split_csv_records(data, opt, rows, bad_line))) {
-    LOG_WARN("failed to parse csv", K(ret), K(path), K(bad_line));
+    LOG_WARN("failed to parse csv", K(ret), K(path.c_str()), K(bad_line));
   } else if (rows.empty()) {
     ret = OB_INVALID_DATA;
   } else {
@@ -893,6 +893,9 @@ static int load_jsonl(const std::string &path, FileTable &table)
       line_start = line_end + 1;
     }
     if (OB_SUCC(ret)) {
+      for (size_t r = 0; r < table.rows_.size(); ++r) {
+        table.rows_[r].resize(table.columns_.size());
+      }
       for (size_t c = 0; c < table.columns_.size(); ++c) {
         FileFieldType type = FT_NULL;
         bool nullable = false;
@@ -953,6 +956,10 @@ static std::string build_json_array(const FileTable &table)
       snprintf(buf, sizeof(buf), "%zu", c);
       json += buf;
       json += "\":";
+      if (c >= table.rows_[r].size() || table.rows_[r][c].is_null_) {
+        json += "null";
+        continue;
+      }
       const FileCell &cell = table.rows_[r][c];
       if (cell.is_null_) {
         json += "null";
@@ -1207,6 +1214,21 @@ static bool parse_bool_literal(const std::string &s, bool &v)
   return false;
 }
 
+static bool get_positional_string(const std::vector<std::string> &args,
+                                  size_t index, std::string &out)
+{
+  size_t pos = 0;
+  for (size_t i = 0; i < args.size(); ++i) {
+    if (args[i].find('=') == std::string::npos) {
+      if (pos == index) {
+        return parse_sql_string(args[i], out);
+      }
+      ++pos;
+    }
+  }
+  return false;
+}
+
 static std::string get_option_string(const std::vector<std::string> &args,
                                      const std::string &key,
                                      const std::string &def)
@@ -1307,10 +1329,772 @@ static int check_path_access(ObSQLSessionInfo &session, const std::string &path)
   ObString secure;
   char resolved[PATH_MAX];
   if (OB_FAIL(session.get_secure_file_priv(secure))) {
-  } else if (NULL == realpath(path.c_str(), resolved)) {
-    ret = OB_FILE_NOT_EXIST;
-  } else if (OB_FAIL(ObResolverUtils::check_secure_path(secure, ObString(static_cast<int32_t>(strlen(resolved)), resolved)))) {
-    LOG_WARN("file path is not allowed by secure_file_priv", K(ret), K(path));
+  } else {
+    std::string check_path;
+    if (NULL != realpath(path.c_str(), resolved)) {
+      check_path.assign(resolved);
+    } else {
+      // The path may be a COPY target or a glob pattern. Resolve its parent
+      // directory so path escapes are still detected before the file exists.
+      size_t slash = path.find_last_of('/');
+      std::string parent = (slash == std::string::npos) ? "." : path.substr(0, slash);
+      std::string base = (slash == std::string::npos) ? path : path.substr(slash + 1);
+      if (parent.empty()) parent = "/";
+      if (NULL == realpath(parent.c_str(), resolved)) {
+        ret = OB_FILE_NOT_EXIST;
+      } else {
+        check_path.assign(resolved);
+        if (check_path.empty() || check_path[check_path.size() - 1] != '/') check_path.push_back('/');
+        check_path += base;
+      }
+    }
+    if (OB_SUCC(ret) &&
+        OB_FAIL(ObResolverUtils::check_secure_path(
+            secure, ObString(static_cast<int32_t>(check_path.size()), check_path.data())))) {
+      LOG_WARN("file path is not allowed by secure_file_priv", K(ret), K(path.c_str()));
+    }
+  }
+  return ret;
+}
+
+// ---------------------------------------------------------------------------
+// Minimal Parquet reader (flat schema, optional/required scalar columns).
+// Supports PLAIN and dictionary pages, V1/V2 data pages, Snappy compression.
+// ---------------------------------------------------------------------------
+
+struct PqSchemaElem
+{
+  int type_;
+  int rep_;
+  int converted_;
+  int type_length_;
+  std::string name_;
+  int children_;
+  PqSchemaElem() : type_(-1), rep_(0), converted_(-1), type_length_(0), name_(), children_(0) {}
+};
+
+struct PqColMeta
+{
+  int type_;
+  int codec_;
+  int64_t num_values_;
+  int64_t data_offset_;
+  int64_t dict_offset_;
+  int64_t compressed_size_;
+  std::vector<std::string> path_;
+  PqColMeta()
+    : type_(-1), codec_(0), num_values_(0), data_offset_(0), dict_offset_(-1),
+      compressed_size_(0), path_() {}
+};
+
+struct PqRowGroup
+{
+  std::vector<PqColMeta> cols_;
+  int64_t num_rows_;
+  PqRowGroup() : cols_(), num_rows_(0) {}
+};
+
+struct PqMeta
+{
+  std::vector<PqSchemaElem> schema_;
+  std::vector<PqRowGroup> groups_;
+  int64_t num_rows_;
+  PqMeta() : schema_(), groups_(), num_rows_(0) {}
+};
+
+class PqCompactReader
+{
+public:
+  PqCompactReader(const unsigned char *p, const unsigned char *end)
+    : p_(p), end_(end), last_(0) {}
+  bool field(int &id, int &type)
+  {
+    if (p_ >= end_) return false;
+    unsigned char b = *p_++;
+    if (0 == b) { id = 0; type = 0; return true; }
+    type = b & 0x0f;
+    int delta = b >> 4;
+    if (0 == delta) {
+      int64_t z = zigzag();
+      id = static_cast<int>(last_ + z);
+    } else {
+      id = last_ + delta;
+    }
+    last_ = static_cast<int16_t>(id);
+    return true;
+  }
+  bool skip(int type)
+  {
+    switch (type) {
+      case 1: case 2: return true;
+      case 3: return p_ < end_ ? (++p_, true) : false;
+      case 4: case 5: case 6: varint(); return true;
+      case 7: p_ += 8; return p_ <= end_;
+      case 8: { uint64_t n = varint(); p_ += n; return p_ <= end_; }
+      case 9: case 10: {
+        if (p_ >= end_) return false;
+        unsigned char h = *p_++;
+        uint64_t n = h >> 4;
+        int et = h & 0x0f;
+        if (15 == n) n = varint();
+        for (uint64_t i = 0; i < n; ++i) if (!skip(et)) return false;
+        return true;
+      }
+      case 11: {
+        uint64_t n = varint();
+        if (n > 0) {
+          if (p_ >= end_) return false;
+          unsigned char h = *p_++;
+          skip(h >> 4);
+          skip(h & 0x0f);
+        }
+        return true;
+      }
+      case 12: {
+        int16_t save = last_; last_ = 0;
+        int id = 0, t = 0;
+        while (field(id, t)) {
+          if (0 == id) break;
+          if (!skip(t)) { last_ = save; return false; }
+        }
+        last_ = save;
+        return true;
+      }
+      default: return false;
+    }
+  }
+  uint64_t varint()
+  {
+    uint64_t v = 0;
+    int shift = 0;
+    while (p_ < end_) {
+      unsigned char c = *p_++;
+      v |= static_cast<uint64_t>(c & 0x7f) << shift;
+      if (!(c & 0x80)) break;
+      shift += 7;
+    }
+    return v;
+  }
+  int64_t zigzag()
+  {
+    uint64_t n = varint();
+    return static_cast<int64_t>(n >> 1) ^ -static_cast<int64_t>(n & 1);
+  }
+  bool read_binary(std::string &out)
+  {
+    uint64_t n = varint();
+    if (p_ + n > end_) return false;
+    out.assign(reinterpret_cast<const char *>(p_), n);
+    p_ += n;
+    return true;
+  }
+  bool read_list_header(uint64_t &n, int &elem_type)
+  {
+    if (p_ >= end_) return false;
+    unsigned char h = *p_++;
+    n = h >> 4;
+    elem_type = h & 0x0f;
+    if (15 == n) n = varint();
+    return true;
+  }
+  const unsigned char *pos() const { return p_; }
+  int16_t &last() { return last_; }
+private:
+  const unsigned char *p_;
+  const unsigned char *end_;
+  int16_t last_;
+};
+
+static bool pq_parse_schema(PqCompactReader &r, PqSchemaElem &s)
+{
+  int16_t save = r.last(); r.last() = 0;
+  int id = 0, type = 0;
+  while (r.field(id, type)) {
+    if (0 == id) break;
+    if (1 == id) s.type_ = static_cast<int>(r.zigzag());
+    else if (2 == id) s.type_length_ = static_cast<int>(r.zigzag());
+    else if (3 == id) s.rep_ = static_cast<int>(r.zigzag());
+    else if (4 == id) { if (!r.read_binary(s.name_)) { r.last() = save; return false; } }
+    else if (5 == id) s.children_ = static_cast<int>(r.zigzag());
+    else if (6 == id) s.converted_ = static_cast<int>(r.zigzag());
+    else if (!r.skip(type)) { r.last() = save; return false; }
+  }
+  r.last() = save;
+  return true;
+}
+
+static bool pq_parse_col_meta(PqCompactReader &r, PqColMeta &m)
+{
+  int16_t save = r.last(); r.last() = 0;
+  int id = 0, type = 0;
+  while (r.field(id, type)) {
+    if (0 == id) break;
+    if (1 == id) m.type_ = static_cast<int>(r.zigzag());
+    else if (2 == id) {
+      uint64_t n = 0; int et = 0;
+      if (!r.read_list_header(n, et)) { r.last() = save; return false; }
+      for (uint64_t i = 0; i < n; ++i) r.zigzag();
+    } else if (3 == id) {
+      uint64_t n = 0; int et = 0;
+      if (!r.read_list_header(n, et)) { r.last() = save; return false; }
+      for (uint64_t i = 0; i < n; ++i) {
+        std::string p;
+        if (!r.read_binary(p)) { r.last() = save; return false; }
+        m.path_.push_back(p);
+      }
+    } else if (4 == id) m.codec_ = static_cast<int>(r.zigzag());
+    else if (5 == id) m.num_values_ = r.zigzag();
+    else if (7 == id) m.compressed_size_ = r.zigzag();
+    else if (9 == id) m.data_offset_ = r.zigzag();
+    else if (11 == id) m.dict_offset_ = r.zigzag();
+    else if (!r.skip(type)) { r.last() = save; return false; }
+  }
+  r.last() = save;
+  return true;
+}
+
+static bool pq_parse_col_chunk(PqCompactReader &r, PqColMeta &m)
+{
+  int16_t save = r.last(); r.last() = 0;
+  int id = 0, type = 0;
+  while (r.field(id, type)) {
+    if (0 == id) break;
+    if (3 == id) {
+      if (!pq_parse_col_meta(r, m)) { r.last() = save; return false; }
+    } else if (!r.skip(type)) { r.last() = save; return false; }
+  }
+  r.last() = save;
+  return true;
+}
+
+static bool pq_parse_row_group(PqCompactReader &r, PqRowGroup &g)
+{
+  int16_t save = r.last(); r.last() = 0;
+  int id = 0, type = 0;
+  while (r.field(id, type)) {
+    if (0 == id) break;
+    if (1 == id) {
+      uint64_t n = 0; int et = 0;
+      if (!r.read_list_header(n, et)) { r.last() = save; return false; }
+      for (uint64_t i = 0; i < n; ++i) {
+        PqColMeta m;
+        if (!pq_parse_col_chunk(r, m)) { r.last() = save; return false; }
+        g.cols_.push_back(m);
+      }
+    } else if (2 == id) { (void)r.zigzag(); }
+    else if (3 == id) g.num_rows_ = r.zigzag();
+    else if (!r.skip(type)) { r.last() = save; return false; }
+  }
+  r.last() = save;
+  return true;
+}
+
+static bool pq_parse_meta(PqCompactReader &r, PqMeta &meta)
+{
+  int16_t save = r.last(); r.last() = 0;
+  int id = 0, type = 0;
+  while (r.field(id, type)) {
+    if (0 == id) break;
+    if (1 == id) { (void)r.zigzag(); }
+    else if (2 == id) {
+      uint64_t n = 0; int et = 0;
+      if (!r.read_list_header(n, et)) { r.last() = save; return false; }
+      for (uint64_t i = 0; i < n; ++i) {
+        PqSchemaElem s;
+        if (!pq_parse_schema(r, s)) { r.last() = save; return false; }
+        meta.schema_.push_back(s);
+      }
+    } else if (3 == id) meta.num_rows_ = r.zigzag();
+    else if (4 == id) {
+      uint64_t n = 0; int et = 0;
+      if (!r.read_list_header(n, et)) { r.last() = save; return false; }
+      for (uint64_t i = 0; i < n; ++i) {
+        PqRowGroup g;
+        if (!pq_parse_row_group(r, g)) { r.last() = save; return false; }
+        meta.groups_.push_back(g);
+      }
+    } else if (!r.skip(type)) { r.last() = save; return false; }
+  }
+  r.last() = save;
+  return true;
+}
+
+static bool pq_snappy(const unsigned char *in, size_t in_len, std::string &out)
+{
+  size_t p = 0;
+  uint64_t expected = 0;
+  int shift = 0;
+  while (p < in_len) {
+    unsigned char c = in[p++];
+    expected |= static_cast<uint64_t>(c & 0x7f) << shift;
+    if (!(c & 0x80)) break;
+    shift += 7;
+  }
+  out.clear();
+  out.reserve(expected);
+  while (p < in_len && out.size() < expected) {
+    unsigned char tag = in[p++];
+    int t = tag & 3;
+    if (0 == t) {
+      size_t len = (tag >> 2) + 1;
+      if (len > 60) {
+        size_t nb = len - 60;
+        len = 0;
+        for (size_t i = 0; i < nb; ++i) len |= static_cast<size_t>(in[p++]) << (8 * i);
+        ++len;
+      }
+      if (p + len > in_len) return false;
+      out.append(reinterpret_cast<const char *>(in + p), len);
+      p += len;
+    } else if (1 == t) {
+      size_t len = ((tag >> 2) & 7) + 4;
+      size_t off = ((tag & 0xe0) << 3) | in[p++];
+      if (0 == off || off > out.size()) return false;
+      for (size_t i = 0; i < len; ++i) out.push_back(out[out.size() - off]);
+    } else if (2 == t) {
+      size_t len = (tag >> 2) + 1;
+      size_t off = static_cast<size_t>(in[p]) | (static_cast<size_t>(in[p + 1]) << 8);
+      p += 2;
+      if (0 == off || off > out.size()) return false;
+      for (size_t i = 0; i < len; ++i) out.push_back(out[out.size() - off]);
+    } else {
+      size_t len = (tag >> 2) + 1;
+      size_t off = static_cast<size_t>(in[p]) | (static_cast<size_t>(in[p + 1]) << 8) |
+                   (static_cast<size_t>(in[p + 2]) << 16) | (static_cast<size_t>(in[p + 3]) << 24);
+      p += 4;
+      if (0 == off || off > out.size()) return false;
+      for (size_t i = 0; i < len; ++i) out.push_back(out[out.size() - off]);
+    }
+  }
+  return out.size() == expected;
+}
+
+static bool pq_varint(const unsigned char *&p, const unsigned char *end, uint64_t &v)
+{
+  v = 0;
+  int shift = 0;
+  while (p < end) {
+    unsigned char c = *p++;
+    v |= static_cast<uint64_t>(c & 0x7f) << shift;
+    if (!(c & 0x80)) return true;
+    shift += 7;
+  }
+  return false;
+}
+
+static bool pq_rle(const unsigned char *&p, const unsigned char *end,
+                   int bit_width, size_t count, bool len_prefix,
+                   std::vector<uint32_t> &out)
+{
+  const unsigned char *stop = end;
+  if (len_prefix) {
+    if (end - p < 4) return false;
+    uint32_t len = static_cast<uint32_t>(p[0]) | (static_cast<uint32_t>(p[1]) << 8) |
+                   (static_cast<uint32_t>(p[2]) << 16) | (static_cast<uint32_t>(p[3]) << 24);
+    p += 4;
+    stop = p + len;
+    if (stop > end) return false;
+  }
+  out.clear();
+  out.reserve(count);
+  while (p < stop && out.size() < count) {
+    uint64_t header = 0;
+    if (!pq_varint(p, stop, header)) return false;
+    if ((header & 1) == 0) {
+      size_t run = static_cast<size_t>(header >> 1);
+      size_t nbytes = (bit_width + 7) / 8;
+      if (p + nbytes > stop) return false;
+      uint32_t v = 0;
+      for (size_t i = 0; i < nbytes; ++i) v |= static_cast<uint32_t>(p[i]) << (8 * i);
+      p += nbytes;
+      for (size_t i = 0; i < run && out.size() < count; ++i) out.push_back(v);
+    } else {
+      size_t groups = static_cast<size_t>(header >> 1);
+      size_t total = groups * 8;
+      size_t nbytes = (total * bit_width + 7) / 8;
+      if (p + nbytes > stop) return false;
+      uint64_t bit = 0;
+      for (size_t i = 0; i < total && out.size() < count; ++i) {
+        uint32_t v = 0;
+        for (int b = 0; b < bit_width; ++b) {
+          size_t byte_i = (bit + b) / 8;
+          size_t bit_i = (bit + b) % 8;
+          if (p[byte_i] & (1 << bit_i)) v |= (1u << b);
+        }
+        bit += bit_width;
+        out.push_back(v);
+      }
+      p += nbytes;
+    }
+  }
+  return out.size() == count;
+}
+
+struct PqPageHeader
+{
+  int type_;
+  int compressed_;
+  int uncompressed_;
+  int num_values_;
+  int encoding_;
+  int def_encoding_;
+  int v2_num_values_;
+  int v2_num_nulls_;
+  int v2_def_len_;
+  int v2_rep_len_;
+  bool v2_compressed_;
+  PqPageHeader()
+    : type_(-1), compressed_(0), uncompressed_(0), num_values_(0), encoding_(-1),
+      def_encoding_(-1), v2_num_values_(0), v2_num_nulls_(0), v2_def_len_(0), v2_rep_len_(0),
+      v2_compressed_(true) {}
+};
+
+static bool pq_data_page_header(PqCompactReader &r, PqPageHeader &h)
+{
+  int16_t save = r.last(); r.last() = 0;
+  int id = 0, type = 0;
+  while (r.field(id, type)) {
+    if (0 == id) break;
+    if (1 == id) h.num_values_ = static_cast<int>(r.zigzag());
+    else if (2 == id) h.encoding_ = static_cast<int>(r.zigzag());
+    else if (3 == id) h.def_encoding_ = static_cast<int>(r.zigzag());
+    else if (!r.skip(type)) { r.last() = save; return false; }
+  }
+  r.last() = save;
+  return true;
+}
+
+static bool pq_dict_page_header(PqCompactReader &r, PqPageHeader &h)
+{
+  int16_t save = r.last(); r.last() = 0;
+  int id = 0, type = 0;
+  while (r.field(id, type)) {
+    if (0 == id) break;
+    if (1 == id) h.num_values_ = static_cast<int>(r.zigzag());
+    else if (2 == id) h.encoding_ = static_cast<int>(r.zigzag());
+    else if (!r.skip(type)) { r.last() = save; return false; }
+  }
+  r.last() = save;
+  return true;
+}
+
+static bool pq_data_page_v2_header(PqCompactReader &r, PqPageHeader &h)
+{
+  int16_t save = r.last(); r.last() = 0;
+  int id = 0, type = 0;
+  while (r.field(id, type)) {
+    if (0 == id) break;
+    if (1 == id) h.v2_num_values_ = static_cast<int>(r.zigzag());
+    else if (2 == id) h.v2_num_nulls_ = static_cast<int>(r.zigzag());
+    else if (4 == id) h.encoding_ = static_cast<int>(r.zigzag());
+    else if (5 == id) h.v2_def_len_ = static_cast<int>(r.zigzag());
+    else if (6 == id) h.v2_rep_len_ = static_cast<int>(r.zigzag());
+    else if (7 == id) h.v2_compressed_ = (1 == type);
+    else if (!r.skip(type)) { r.last() = save; return false; }
+  }
+  r.last() = save;
+  return true;
+}
+
+static bool pq_page_header(const std::string &data, size_t off, PqPageHeader &h, size_t &used)
+{
+  if (off >= data.size()) return false;
+  PqCompactReader r(reinterpret_cast<const unsigned char *>(data.data()) + off,
+                    reinterpret_cast<const unsigned char *>(data.data()) + data.size());
+  int16_t save = r.last(); r.last() = 0;
+  int id = 0, type = 0;
+  while (r.field(id, type)) {
+    if (0 == id) break;
+    if (1 == id) h.type_ = static_cast<int>(r.zigzag());
+    else if (2 == id) h.uncompressed_ = static_cast<int>(r.zigzag());
+    else if (3 == id) h.compressed_ = static_cast<int>(r.zigzag());
+    else if (5 == id) { if (!pq_data_page_header(r, h)) return false; }
+    else if (7 == id) { if (!pq_dict_page_header(r, h)) return false; }
+    else if (8 == id) { if (!pq_data_page_v2_header(r, h)) return false; }
+    else if (!r.skip(type)) return false;
+  }
+  r.last() = save;
+  used = static_cast<size_t>(r.pos() - (reinterpret_cast<const unsigned char *>(data.data()) + off));
+  return true;
+}
+
+static std::string pq_date(int32_t days)
+{
+  int64_t z = static_cast<int64_t>(days) + 719468;
+  int64_t era = (z >= 0 ? z : z - 146096) / 146097;
+  unsigned doe = static_cast<unsigned>(z - era * 146097);
+  unsigned yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+  int64_t y = static_cast<int64_t>(yoe) + era * 400;
+  unsigned doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+  unsigned mp = (5 * doy + 2) / 153;
+  unsigned d = doy - (153 * mp + 2) / 5 + 1;
+  unsigned m = mp + (mp < 10 ? 3 : -9);
+  y += (m <= 2);
+  char buf[64];
+  snprintf(buf, sizeof(buf), "%04lld-%02u-%02u", static_cast<long long>(y), m, d);
+  return buf;
+}
+
+static std::string pq_datetime(int64_t millis)
+{
+  int64_t days = millis / 86400000LL;
+  int64_t rem = millis % 86400000LL;
+  if (rem < 0) { rem += 86400000LL; --days; }
+  int hh = static_cast<int>(rem / 3600000); rem %= 3600000;
+  int mm = static_cast<int>(rem / 60000); rem %= 60000;
+  int ss = static_cast<int>(rem / 1000);
+  char buf[64];
+  snprintf(buf, sizeof(buf), "%s %02d:%02d:%02d", pq_date(static_cast<int32_t>(days)).c_str(), hh, mm, ss);
+  return buf;
+}
+
+static bool pq_plain_values(const unsigned char *&p, const unsigned char *end,
+                            int type, size_t count, std::vector<std::string> &out)
+{
+  out.clear();
+  out.reserve(count);
+  for (size_t i = 0; i < count; ++i) {
+    if (0 == type) {
+      size_t byte_i = i / 8;
+      size_t bit_i = i % 8;
+      if (p + byte_i >= end) return false;
+      out.push_back((p[byte_i] & (1 << bit_i)) ? "true" : "false");
+    } else if (1 == type) {
+      if (end - p < 4) return false;
+      int32_t v = static_cast<int32_t>(static_cast<uint32_t>(p[0]) |
+                                       (static_cast<uint32_t>(p[1]) << 8) |
+                                       (static_cast<uint32_t>(p[2]) << 16) |
+                                       (static_cast<uint32_t>(p[3]) << 24));
+      p += 4;
+      char buf[32]; snprintf(buf, sizeof(buf), "%d", v); out.push_back(buf);
+    } else if (2 == type) {
+      if (end - p < 8) return false;
+      uint64_t u = 0;
+      for (int b = 0; b < 8; ++b) u |= static_cast<uint64_t>(p[b]) << (8 * b);
+      p += 8;
+      char buf[32]; snprintf(buf, sizeof(buf), "%lld", static_cast<long long>(u)); out.push_back(buf);
+    } else if (4 == type) {
+      if (end - p < 4) return false;
+      uint32_t u = static_cast<uint32_t>(p[0]) | (static_cast<uint32_t>(p[1]) << 8) |
+                   (static_cast<uint32_t>(p[2]) << 16) | (static_cast<uint32_t>(p[3]) << 24);
+      float f; memcpy(&f, &u, 4); p += 4;
+      char buf[64]; snprintf(buf, sizeof(buf), "%.9g", f); out.push_back(buf);
+    } else if (5 == type) {
+      if (end - p < 8) return false;
+      uint64_t u = 0;
+      for (int b = 0; b < 8; ++b) u |= static_cast<uint64_t>(p[b]) << (8 * b);
+      double d; memcpy(&d, &u, 8); p += 8;
+      char buf[64]; snprintf(buf, sizeof(buf), "%.17g", d); out.push_back(buf);
+    } else if (6 == type) {
+      if (end - p < 4) return false;
+      uint32_t len = static_cast<uint32_t>(p[0]) | (static_cast<uint32_t>(p[1]) << 8) |
+                     (static_cast<uint32_t>(p[2]) << 16) | (static_cast<uint32_t>(p[3]) << 24);
+      p += 4;
+      if (static_cast<size_t>(end - p) < len) return false;
+      out.push_back(std::string(reinterpret_cast<const char *>(p), len));
+      p += len;
+    } else {
+      return false;
+    }
+  }
+  return true;
+}
+
+static int load_parquet(const std::string &path, FileTable &table)
+{
+  int ret = OB_SUCCESS;
+  std::string data;
+  if (OB_FAIL(read_file_bytes(path, data))) {
+  } else if (data.size() < 12 || 0 != data.compare(0, 4, "PAR1") ||
+             0 != data.compare(data.size() - 4, 4, "PAR1")) {
+    ret = OB_INVALID_DATA;
+  } else {
+    uint32_t footer_len = static_cast<uint32_t>(static_cast<unsigned char>(data[data.size() - 8])) |
+                          (static_cast<uint32_t>(static_cast<unsigned char>(data[data.size() - 7])) << 8) |
+                          (static_cast<uint32_t>(static_cast<unsigned char>(data[data.size() - 6])) << 16) |
+                          (static_cast<uint32_t>(static_cast<unsigned char>(data[data.size() - 5])) << 24);
+    size_t footer_off = data.size() - 8 - footer_len;
+    if (footer_off >= data.size()) {
+      ret = OB_INVALID_DATA;
+    } else {
+      PqMeta meta;
+      PqCompactReader r(reinterpret_cast<const unsigned char *>(data.data()) + footer_off,
+                        reinterpret_cast<const unsigned char *>(data.data()) + data.size() - 8);
+      if (!pq_parse_meta(r, meta)) {
+        ret = OB_INVALID_DATA;
+      } else if (meta.schema_.size() < 2) {
+        ret = OB_INVALID_DATA;
+      } else {
+        // Flat schema: every non-root element is a column.
+        for (size_t i = 1; i < meta.schema_.size(); ++i) {
+          FileColumn col;
+          col.name_ = meta.schema_[i].name_;
+          col.nullable_ = (meta.schema_[i].rep_ == 1);
+          int t = meta.schema_[i].type_;
+          int conv = meta.schema_[i].converted_;
+          if (0 == t) col.type_ = FT_BOOLEAN;
+          else if (1 == t && 6 == conv) col.type_ = FT_DATE;
+          else if (2 == t && (9 == conv || 10 == conv)) col.type_ = FT_DATETIME;
+          else if (1 == t || 2 == t) col.type_ = FT_BIGINT;
+          else if (4 == t || 5 == t) col.type_ = FT_DOUBLE;
+          else col.type_ = FT_VARCHAR;
+          table.columns_.push_back(col);
+        }
+        dedup_column_names(table.columns_);
+        table.rows_.resize(static_cast<size_t>(meta.num_rows_));
+        for (size_t g = 0; g < meta.groups_.size(); ++g) {
+          PqRowGroup &group = meta.groups_[g];
+          size_t row_base = 0;
+          for (size_t pg = 0; pg < g; ++pg) row_base += static_cast<size_t>(meta.groups_[pg].num_rows_);
+          for (size_t c = 0; c < group.cols_.size() && c < table.columns_.size(); ++c) {
+            PqColMeta &m = group.cols_[c];
+            int64_t start = (m.dict_offset_ >= 0) ? m.dict_offset_ : m.data_offset_;
+            int64_t end = start + m.compressed_size_;
+            if (start < 0 || end > static_cast<int64_t>(data.size())) {
+              ret = OB_INVALID_DATA;
+              break;
+            }
+            std::vector<std::string> dictionary;
+            std::vector<FileCell> values;
+            values.reserve(static_cast<size_t>(group.num_rows_));
+            size_t off = static_cast<size_t>(start);
+            while (off < static_cast<size_t>(end) && values.size() < static_cast<size_t>(group.num_rows_)) {
+              PqPageHeader h;
+              size_t used = 0;
+              if (!pq_page_header(data, off, h, used) || h.compressed_ < 0 ||
+                  off + used + static_cast<size_t>(h.compressed_) > data.size()) {
+                ret = OB_INVALID_DATA;
+                break;
+              }
+              const unsigned char *payload = reinterpret_cast<const unsigned char *>(data.data()) + off + used;
+              size_t payload_len = static_cast<size_t>(h.compressed_);
+              std::string raw;
+              if (2 == h.type_) { // dictionary page
+                if (1 == m.codec_) {
+                  if (!pq_snappy(payload, payload_len, raw)) { ret = OB_INVALID_DATA; break; }
+                } else {
+                  raw.assign(reinterpret_cast<const char *>(payload), payload_len);
+                }
+                const unsigned char *p = reinterpret_cast<const unsigned char *>(raw.data());
+                const unsigned char *e = p + raw.size();
+                if (!pq_plain_values(p, e, m.type_, static_cast<size_t>(h.num_values_), dictionary)) {
+                  ret = OB_INVALID_DATA; break;
+                }
+              } else if (0 == h.type_ || 3 == h.type_) { // data page v1/v2
+                int num_values = (3 == h.type_) ? h.v2_num_values_ : h.num_values_;
+                int encoding = h.encoding_;
+                const unsigned char *data_ptr = payload;
+                const unsigned char *data_end = payload + payload_len;
+                size_t def_count = static_cast<size_t>(num_values);
+                std::vector<uint32_t> def_levels;
+                if (3 == h.type_) {
+                  if (h.v2_rep_len_ > 0) { data_ptr += h.v2_rep_len_; }
+                  size_t def_len = static_cast<size_t>(h.v2_def_len_);
+                  if (data_ptr + def_len > data_end) { ret = OB_INVALID_DATA; break; }
+                  if (0 == meta.schema_[c + 1].rep_ || 0 == h.v2_num_nulls_) {
+                    def_levels.assign(def_count, 1);
+                  } else {
+                    const unsigned char *dp = data_ptr;
+                    const unsigned char *de = data_ptr + def_len;
+                    if (!pq_rle(dp, de, 1, def_count, false, def_levels)) { ret = OB_INVALID_DATA; break; }
+                  }
+                  data_ptr += def_len;
+                  if (h.v2_compressed_ && 1 == m.codec_) {
+                    size_t expect = 0;
+                    if (1 == m.type_ || 4 == m.type_) expect = def_count * 4;
+                    else if (2 == m.type_ || 5 == m.type_) expect = def_count * 8;
+                    else if (0 == m.type_) expect = (def_count + 7) / 8;
+                    bool decompressed = false;
+                    if (expect > 0) {
+                      for (size_t cand = 0; cand <= 8 && cand < payload_len; ++cand) {
+                        if (pq_snappy(payload + cand, payload_len - cand, raw) && raw.size() == expect) {
+                          decompressed = true;
+                          break;
+                        }
+                      }
+                    }
+                    if (!decompressed && !pq_snappy(data_ptr, static_cast<size_t>(data_end - data_ptr), raw)) {
+                      ret = OB_INVALID_DATA; break;
+                    }
+                    data_ptr = reinterpret_cast<const unsigned char *>(raw.data());
+                    data_end = data_ptr + raw.size();
+                  }
+                } else {
+                  if (0 == meta.schema_[c + 1].rep_) {
+                    def_levels.assign(def_count, 1);
+                  } else {
+                    const unsigned char *dp = data_ptr;
+                    if (!pq_rle(dp, data_end, 1, def_count, true, def_levels)) { ret = OB_INVALID_DATA; break; }
+                    data_ptr = dp;
+                  }
+                  if (1 == m.codec_) {
+                    if (!pq_snappy(data_ptr, static_cast<size_t>(data_end - data_ptr), raw)) {
+                      ret = OB_INVALID_DATA; break;
+                    }
+                    data_ptr = reinterpret_cast<const unsigned char *>(raw.data());
+                    data_end = data_ptr + raw.size();
+                  }
+                }
+                size_t non_null = 0;
+                for (size_t i = 0; i < def_levels.size(); ++i) if (def_levels[i] != 0) ++non_null;
+                std::vector<std::string> decoded;
+                bool ok = true;
+                if (0 == encoding) {
+                  ok = pq_plain_values(data_ptr, data_end, m.type_, non_null, decoded);
+                } else if (2 == encoding || 8 == encoding) {
+                  if (data_ptr >= data_end) { ok = false; }
+                  else {
+                    int bit_width = *data_ptr++;
+                    std::vector<uint32_t> indices;
+                    if (!pq_rle(data_ptr, data_end, bit_width, non_null, false, indices)) {
+                      ok = false;
+                    } else {
+                      for (size_t i = 0; i < indices.size() && ok; ++i) {
+                        if (indices[i] >= dictionary.size()) ok = false;
+                        else decoded.push_back(dictionary[indices[i]]);
+                      }
+                    }
+                  }
+                } else {
+                  ok = false;
+                }
+                if (!ok) { ret = OB_INVALID_DATA; break; }
+                size_t vi = 0;
+                for (size_t i = 0; i < def_levels.size() && values.size() < static_cast<size_t>(group.num_rows_); ++i) {
+                  FileCell cell;
+                  if (def_levels[i] != 0) {
+                    if (vi >= decoded.size()) { ret = OB_INVALID_DATA; break; }
+                    cell.is_null_ = false;
+                    cell.text_ = decoded[vi++];
+                    if (table.columns_[c].type_ == FT_DATE && m.type_ == 1) {
+                      cell.text_ = pq_date(atoi(cell.text_.c_str()));
+                    } else if (table.columns_[c].type_ == FT_DATETIME && m.type_ == 2) {
+                      int64_t v = atoll(cell.text_.c_str());
+                      if (10 == meta.schema_[c + 1].converted_) v /= 1000;
+                      cell.text_ = pq_datetime(v);
+                    }
+                  } else {
+                    cell.is_null_ = true;
+                  }
+                  values.push_back(cell);
+                }
+              } else {
+                // index page or unsupported page type; skip it
+              }
+              off += used + payload_len;
+            }
+            if (OB_FAIL(ret)) break;
+            for (size_t i = 0; i < values.size() && row_base + i < table.rows_.size(); ++i) {
+              if (table.rows_[row_base + i].size() < table.columns_.size()) {
+                table.rows_[row_base + i].resize(table.columns_.size());
+              }
+              table.rows_[row_base + i][c] = values[i];
+            }
+          }
+          if (OB_FAIL(ret)) break;
+        }
+      }
+    }
   }
   return ret;
 }
@@ -1362,8 +2146,7 @@ static int load_file_table(ObSQLSessionInfo &session,
     if (OB_FAIL(load_jsonl(path, table))) {
     }
   } else if (format == "parquet") {
-    ret = OB_NOT_SUPPORTED;
-    LOG_USER_ERROR(OB_NOT_SUPPORTED, "read_parquet");
+    ret = load_parquet(path, table);
   } else {
     ret = OB_ERR_PARSE_SQL;
   }
@@ -1447,6 +2230,10 @@ static int rewrite_describe(const std::string &input,
         else if (call.name_ == "read_parquet") format = "parquet";
         else format = "json";
         std::string fmt_opt = get_option_string(args, "format", "");
+        if (fmt_opt.empty()) {
+          std::string pos_fmt;
+          if (get_positional_string(args, 1, pos_fmt) && !pos_fmt.empty()) fmt_opt = pos_fmt;
+        }
         if (!fmt_opt.empty()) format = fmt_opt;
         FileTable table;
         if (OB_FAIL(load_file_table(session, path, format, args, table))) {
@@ -1731,6 +2518,10 @@ static int rewrite_general(const std::string &input,
         else if (call.name_ == "read_parquet") format = "parquet";
         else format = "json";
         std::string fmt_opt = get_option_string(args, "format", "");
+        if (fmt_opt.empty()) {
+          std::string pos_fmt;
+          if (get_positional_string(args, 1, pos_fmt) && !pos_fmt.empty()) fmt_opt = pos_fmt;
+        }
         if (!fmt_opt.empty()) format = fmt_opt;
         if (format == "xml") {
           ret = OB_ERR_PARSE_SQL;

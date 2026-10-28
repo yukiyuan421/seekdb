@@ -17,6 +17,7 @@
 #define USING_LOG_PREFIX SQL
 #include "config_bridge.h"
 #include "sql/ob_sql.h"
+#include "sql/ob_file_sql_rewriter.h"
 #include "lib/json/ob_json_print_utils.h"
 #include "lib/stat/ob_diagnostic_info_guard.h"
 #include "query/runtime/ob_query_runtime_environment.h"
@@ -159,8 +160,12 @@ int ObSql::stmt_prepare(const common::ObString &stmt,
 {
   int ret = OB_SUCCESS;
   LinkExecCtxGuard link_guard(result.get_session(), result.get_exec_context());
+  ObString file_sql_stmt;
   if (OB_FAIL(sanity_check(context))) {
-  } else if (OB_FAIL(handle_ps_prepare(stmt, context, result, is_inner_sql))) {
+  } else if (OB_FAIL(ObFileSqlRewriter::rewrite(stmt, result.get_session(),
+                                                result.get_mem_pool(), file_sql_stmt))) {
+  } else if (OB_FAIL(handle_ps_prepare(file_sql_stmt.empty() ? stmt : file_sql_stmt,
+                                       context, result, is_inner_sql))) {
   }
   if (OB_FAIL(ret) && OB_SUCCESS == result.get_errcode()) {
     result.set_errcode(ret);
@@ -185,8 +190,12 @@ int ObSql::stmt_query(const common::ObString &stmt, ObSqlCtx &context, ObResultS
 #endif
   NG_TRACE(parse_begin);
   //1 check inited
+  ObString file_sql_stmt;
   if (OB_FAIL(sanity_check(context))) {
-  } else if (OB_FAIL(handle_text_query(stmt, context, result))) {
+  } else if (OB_FAIL(ObFileSqlRewriter::rewrite(stmt, result.get_session(),
+                                                result.get_mem_pool(), file_sql_stmt))) {
+  } else if (OB_FAIL(handle_text_query(file_sql_stmt.empty() ? stmt : file_sql_stmt,
+                                       context, result))) {
     if (OB_EAGAIN != ret) {
     }
   }

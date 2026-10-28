@@ -28,6 +28,7 @@ SQL_UNITY_GROUPS = [
             "src/sql/ob_scanner.cpp",
             "src/sql/ob_spi.cpp",
             "src/sql/ob_sql.cpp",
+            "src/sql/ob_file_sql_rewriter.cpp",
             "src/sql/ob_sql_context.cpp",
             "src/sql/ob_sql_define.cpp",
             "src/sql/ob_sql_task.cpp",

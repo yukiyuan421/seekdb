@@ -59,6 +59,7 @@ SQL_PUBLIC_HEADER_ROOTS = [
     "ob_result_set.h",
     "ob_scanner.h",
     "ob_spi.h",
+    "ob_file_sql_rewriter.h",
     "ob_sql.h",
     "ob_sql_context.h",
     "ob_sql_init.h",

@@ -2459,6 +2459,19 @@
     "background_cn": "导入导出功能未限制文件访问可能存在漏洞",
     "ref_url": ""
   },
+  "enable_file_sql": {
+    "id": 10103,
+    "name": "enable_file_sql",
+    "default_value": "0",
+    "base_value": "0",
+    "data_type": "bool",
+    "info": "Enable querying local CSV, JSONL and Parquet files with read_csv/read_json/read_parquet.",
+    "flags": "SESSION | GLOBAL | INFLUENCE_PLAN",
+    "publish_version": "226",
+    "info_cn": "开启后允许通过 read_csv/read_json/read_parquet 直接查询本地文件",
+    "background_cn": "文件即数据库功能默认关闭，开启后仍需通过 secure_file_priv 校验",
+    "ref_url": ""
+  },
   "_enable_parallel_query": {
     "id": 10104,
     "name": "_enable_parallel_query",

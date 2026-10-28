@@ -32,6 +32,18 @@ using namespace oceanbase::common;
 using namespace oceanbase::sqlclient;
 using namespace oceanbase::transaction;
 
+// ObHexEscapeSqlStr treats a NULL data pointer as SQL NULL (see
+// ObDMLSqlSplicer::append_value). For nullable text columns whose empty value is
+// meaningful -- e.g. access_key is legitimately empty for ollama -- an ObString
+// with a NULL pointer would be persisted as SQL NULL, and readers that do not
+// tolerate NULL would then fail with OB_ERR_NULL_VALUE. Normalize such values to
+// an empty string with a valid (non-NULL) pointer so that '' is stored instead.
+static ObString normalize_empty_string(const ObString &str)
+{
+  static const char EMPTY_STR[] = "";
+  return NULL == str.ptr() ? ObString(0, EMPTY_STR) : str;
+}
+
 int ObAiServiceProxy::insert_ai_endpoint(ObMySQLTransaction &trans, const int64_t new_endpoint_version, const ObAiModelEndpointInfo &endpoint)
 {
   int ret = OB_SUCCESS;
@@ -45,7 +57,7 @@ int ObAiServiceProxy::insert_ai_endpoint(ObMySQLTransaction &trans, const int64_
   } else if (OB_FAIL(sql.add_column("endpoint_name", endpoint.name_))) {
   } else if (OB_FAIL(sql.add_column("ai_model_name", ObHexEscapeSqlStr(endpoint.ai_model_name_)))) {
   } else if (OB_FAIL(sql.add_column("url", ObHexEscapeSqlStr(endpoint.url_)))) {
-  } else if (OB_FAIL(sql.add_column("access_key", ObHexEscapeSqlStr(endpoint.access_key_)))) {
+  } else if (OB_FAIL(sql.add_column("access_key", ObHexEscapeSqlStr(normalize_empty_string(endpoint.access_key_))))) {
   } else if (OB_FAIL(sql.add_column("request_model_name", ObHexEscapeSqlStr(endpoint.request_model_name_)))) {
   } else if (OB_FAIL(sql.add_column("provider", ObHexEscapeSqlStr(endpoint.provider_)))) {
   } else if (OB_FAIL(sql.add_column("parameters", ObHexEscapeSqlStr(endpoint.parameters_)))) {
@@ -77,7 +89,7 @@ int ObAiServiceProxy::update_ai_endpoint(ObMySQLTransaction &trans, const int64_
   } else if (OB_FAIL(sql.add_column("endpoint_name", endpoint.name_))) {
   } else if (OB_FAIL(sql.add_column("ai_model_name", ObHexEscapeSqlStr(endpoint.ai_model_name_)))) {
   } else if (OB_FAIL(sql.add_column("url", ObHexEscapeSqlStr(endpoint.url_)))) {
-  } else if (OB_FAIL(sql.add_column("access_key", ObHexEscapeSqlStr(endpoint.access_key_)))) {
+  } else if (OB_FAIL(sql.add_column("access_key", ObHexEscapeSqlStr(normalize_empty_string(endpoint.access_key_))))) {
   } else if (OB_FAIL(sql.add_column("request_model_name", ObHexEscapeSqlStr(endpoint.request_model_name_)))) {
   } else if (OB_FAIL(sql.add_column("provider", ObHexEscapeSqlStr(endpoint.provider_)))) {
   } else if (OB_FAIL(sql.add_column("parameters", ObHexEscapeSqlStr(endpoint.parameters_)))) {
@@ -200,7 +212,10 @@ int ObAiServiceProxy::build_ai_endpoint_(ObArenaAllocator &allocator, ObMySQLRes
   EXTRACT_VARCHAR_FIELD_MYSQL(result, "endpoint_name", name);
   EXTRACT_VARCHAR_FIELD_MYSQL(result, "ai_model_name", ai_model_name);
   EXTRACT_VARCHAR_FIELD_MYSQL(result, "url", url);
-  EXTRACT_VARCHAR_FIELD_MYSQL(result, "access_key", access_key);
+  // access_key is optional (e.g. ollama does not need one). It may be stored as
+  // SQL NULL by historical rows, so tolerate NULL here and normalize it to an
+  // empty string below instead of failing with OB_ERR_NULL_VALUE.
+  EXTRACT_VARCHAR_FIELD_MYSQL_WITH_DEFAULT_VALUE(result, "access_key", access_key, true, false, ""/*wont be used*/);
   EXTRACT_VARCHAR_FIELD_MYSQL_WITH_DEFAULT_VALUE(result, "provider", provider, true, false, ""/*wont be used*/);
   EXTRACT_VARCHAR_FIELD_MYSQL_WITH_DEFAULT_VALUE(result, "request_model_name", request_model_name, true, false, ""/*wont be used*/);
   EXTRACT_VARCHAR_FIELD_MYSQL_WITH_DEFAULT_VALUE(result, "parameters", arguments, true, false, ""/*wont be used*/);
@@ -218,6 +233,13 @@ int ObAiServiceProxy::build_ai_endpoint_(ObArenaAllocator &allocator, ObMySQLRes
   } else if (OB_FAIL(deep_copy_ob_string(allocator, arguments, endpoint.parameters_))) {
   } else if (OB_FAIL(deep_copy_ob_string(allocator, request_transform_fn, endpoint.request_transform_fn_))) {
   } else if (OB_FAIL(deep_copy_ob_string(allocator, response_transform_fn, endpoint.response_transform_fn_))) {
+  }
+
+  if (OB_SUCC(ret)) {
+    // deep_copy_ob_string() maps an empty source to a NULL data pointer. The
+    // access_key may legitimately be empty (ollama), and ALTER re-persists this
+    // value; keep a valid pointer so that '' is written back instead of NULL.
+    endpoint.access_key_ = normalize_empty_string(endpoint.access_key_);
   }
 
   if (OB_SUCC(ret)) {

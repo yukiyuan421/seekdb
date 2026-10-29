@@ -20,7 +20,6 @@
 #include "lib/container/ob_iarray.h"
 #include "share/inner_table/local_table_schema.h"
 #include "common/mysqlclient/ob_isql_client.h"
-#include "common/mysqlclient/ob_mysql_transaction.h"
 
 namespace oceanbase
 {

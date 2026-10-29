@@ -3457,11 +3457,61 @@ int ObAlterTableResolver::resolve_add_column(const ParseNode &node, ObColumnName
         if (OB_SUCC(ret)) {
           if (OB_FAIL(alter_table_stmt->add_column(alter_column_schema))) {
           } else if (FALSE_IT(alter_table_stmt->set_sql_mode(session_info_->get_sql_mode()))) {
+          } else if (stat.is_ai_column_
+                     && OB_FAIL(append_ai_hidden_columns_for_add(alter_column_schema,
+                                                                 alter_table_stmt))) {
           }
         }
       }
     }
     add_column_cnt_++;
+  }
+  return ret;
+}
+
+// An AI column is backed by three hidden helper columns (state/request/result_spec).
+// When an AI column is added by ALTER TABLE ... ADD COLUMN, the hidden columns must
+// be added in the very same ALTER statement.
+int ObAlterTableResolver::append_ai_hidden_columns_for_add(
+    const share::schema::AlterColumnSchema &ai_column,
+    ObAlterTableStmt *alter_table_stmt)
+{
+  int ret = OB_SUCCESS;
+  const char *hidden_suffixes[3] = {"__ai_state", "__ai_request", "__ai_result_spec"};
+  const ObObjType hidden_types[3] = {ObIntType, ObVarcharType, ObVarcharType};
+  const ObString col_name = ai_column.get_column_name_str();
+  if (OB_ISNULL(alter_table_stmt)) {
+    ret = OB_INVALID_ARGUMENT;
+  } else {
+    for (int64_t i = 0; OB_SUCC(ret) && i < 3; ++i) {
+      char name_buf[OB_MAX_COLUMN_NAME_LENGTH + 32];
+      int64_t pos = 0;
+      if (OB_FAIL(databuff_printf(name_buf, sizeof(name_buf), pos, "%.*s%s",
+                                  col_name.length(), col_name.ptr(), hidden_suffixes[i]))) {
+        SQL_RESV_LOG(WARN, "build ai hidden column name failed", K(ret));
+      } else {
+        AlterColumnSchema hidden_col;
+        hidden_col.reset();
+        hidden_col.alter_type_ = OB_DDL_ADD_COLUMN;
+        hidden_col.set_data_type(hidden_types[i]);
+        hidden_col.set_nullable(true);
+        hidden_col.set_is_hidden(true);
+        if (ObVarcharType == hidden_types[i]) {
+          hidden_col.set_data_length(1024);
+          hidden_col.set_charset_type(CHARSET_UTF8MB4);
+          hidden_col.set_collation_type(CS_TYPE_UTF8MB4_GENERAL_CI);
+        } else {
+          hidden_col.set_charset_type(CHARSET_BINARY);
+          hidden_col.set_collation_type(CS_TYPE_BINARY);
+        }
+        if (OB_FAIL(hidden_col.set_column_name(
+                    ObString(static_cast<int32_t>(pos), name_buf)))) {
+          SQL_RESV_LOG(WARN, "set ai hidden column name failed", K(ret));
+        } else if (OB_FAIL(alter_table_stmt->add_column(hidden_col))) {
+          SQL_RESV_LOG(WARN, "add ai hidden alter column failed", K(ret));
+        }
+      }
+    }
   }
   return ret;
 }

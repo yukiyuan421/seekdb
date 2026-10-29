@@ -137,10 +137,93 @@ int ObCreateTableResolver::add_hidden_tablet_seq_col()
   return ret;
 }
 
-// Set additional information for the temporary table
-int ObCreateTableResolver::set_temp_table_info(ObTableSchema &table_schema, ParseNode *commit_option_node)
+int ObCreateTableResolver::add_ai_column_hidden_cols(
+    ObColumnSchemaV2 &column,
+    ObSEArray<ObColumnSchemaV2, SEARRAY_INIT_NUM> &resolved_cols)
 {
   int ret = OB_SUCCESS;
+  // Each AI column carries three hidden helper columns:
+  //   state       (int)          : per row task state (PENDING/READY/FAILED)
+  //   request     (varchar 1024) : request snapshot / request id used for stale guard
+  //   result_spec (varchar 1024) : typed result contract of the AI column
+  const char *hidden_suffixes[3] = {"__ai_state", "__ai_request", "__ai_result_spec"};
+  ObObjType hidden_types[3] = {ObIntType, ObVarcharType, ObVarcharType};
+  const ObString col_name = column.get_column_name_str();
+  char hidden_name_buf[OB_MAX_COLUMN_NAME_LENGTH + 32];
+  for (int i = 0; OB_SUCC(ret) && i < 3; ++i) {
+    int64_t pos = 0;
+    if (OB_FAIL(databuff_printf(hidden_name_buf, sizeof(hidden_name_buf), pos,
+                                "%.*s%s",
+                                col_name.length(), col_name.ptr(), hidden_suffixes[i]))) {
+      SQL_RESV_LOG(WARN, "build ai hidden column name failed", K(ret));
+    } else {
+      ObColumnSchemaV2 hidden_col;
+      hidden_col.reset();
+      hidden_col.set_column_id(gen_column_id());
+      hidden_col.set_data_type(hidden_types[i]);
+      hidden_col.set_nullable(true);
+      hidden_col.set_is_hidden(true);
+      if (ObVarcharType == hidden_types[i]) {
+        hidden_col.set_data_length(1024);
+        hidden_col.set_charset_type(CHARSET_UTF8MB4);
+        hidden_col.set_collation_type(CS_TYPE_UTF8MB4_GENERAL_CI);
+      } else {
+        hidden_col.set_charset_type(CHARSET_BINARY);
+        hidden_col.set_collation_type(CS_TYPE_BINARY);
+      }
+      if (OB_FAIL(hidden_col.set_column_name(ObString(static_cast<int32_t>(pos), hidden_name_buf)))) {
+        SQL_RESV_LOG(WARN, "set ai hidden column name failed", K(ret));
+      } else if (OB_FAIL(resolved_cols.push_back(hidden_col))) {
+        SQL_RESV_LOG(WARN, "push ai hidden column failed", K(ret));
+      }
+    }
+  }
+  return ret;
+}
+
+int ObCreateTableResolver::check_ai_column_dependencies(share::schema::ObTableSchema &table_schema)
+{
+  int ret = OB_SUCCESS;
+  for (ObTableSchema::const_column_iterator it = table_schema.column_begin();
+       OB_SUCC(ret) && it != table_schema.column_end(); ++it) {
+    const ObColumnSchemaV2 *col = *it;
+    if (OB_ISNULL(col)) {
+      ret = OB_ERR_UNEXPECTED;
+      SQL_RESV_LOG(WARN, "null column schema", K(ret));
+    } else if (!col->is_ai_column()) {
+      // do nothing
+    } else {
+      ObAiColumnMeta meta;
+      if (OB_FAIL(ObAiColumnMeta::unpack(col->get_ai_column_meta(), meta))) {
+        SQL_RESV_LOG(WARN, "unpack ai column metadata failed", K(ret),
+                     K(col->get_column_name_str()));
+      } else {
+        const ObString deps = meta.deps_;
+        const char *p = deps.ptr();
+        const char *end = NULL == p ? p : p + deps.length();
+        while (OB_SUCC(ret) && NULL != p && p < end) {
+          const char *comma = p;
+          while (comma < end && ',' != *comma) {
+            ++comma;
+          }
+          ObString dep_name(static_cast<int32_t>(comma - p), p);
+          const ObColumnSchemaV2 *dep_col = table_schema.get_column_schema(dep_name);
+          if (NULL != dep_col && dep_col->is_ai_column()) {
+            ret = OB_NOT_SUPPORTED;
+            SQL_RESV_LOG(WARN, "ai column depends on another ai column", K(ret),
+                         K(col->get_column_name_str()), K(dep_name));
+          }
+          p = (comma < end) ? comma + 1 : comma;
+        }
+      }
+    }
+  }
+  return ret;
+}
+
+// Set additional information for the temporary table
+int ObCreateTableResolver::set_temp_table_info(ObTableSchema &table_schema, ParseNode *commit_option_node)
+{  int ret = OB_SUCCESS;
   session_info_->set_has_temp_table_flag();
   if (OB_FAIL(set_table_name(table_name_))) {
   } else {
@@ -842,6 +925,14 @@ int ObCreateTableResolver::resolve_table_elements(const ParseNode *node,
             if (OB_FAIL(stats.push_back(stat))) {
             }
           }
+
+          // AI columns materialize three hidden helper columns (state/request/result_spec)
+          // that the async worker uses to track and fill the generated value.
+          if (OB_SUCC(ret) && column.is_ai_column()) {
+            if (OB_FAIL(add_ai_column_hidden_cols(column, resolved_cols))) {
+              SQL_RESV_LOG(WARN, "add ai column hidden cols failed", K(ret));
+            }
+          }
         }
       } else if (T_PRIMARY_KEY == element->type_) {
         if (primary_key_set_in_heap_table) {
@@ -897,6 +988,9 @@ int ObCreateTableResolver::resolve_table_elements(const ParseNode *node,
     }
 
     // A table must have at least one column as a visible column
+    if (OB_SUCC(ret) && OB_FAIL(check_ai_column_dependencies(table_schema))) {
+    }
+
     if (OB_SUCC(ret)) {
       // RESOLVE_NON_COL == resolve_rule when, only parse non-column definitions
       if (RESOLVE_NON_COL != resolve_rule && !has_visible_col) {

@@ -21,6 +21,8 @@
 #include "rootserver/ob_lob_piece_builder.h"
 #include "rootserver/ob_table_creator.h"
 #include "rootserver/freeze/ob_major_freeze_helper.h"
+#include "share/ob_dml_sql_splicer.h"
+#include "share/inner_table/ob_inner_table_schema_constants.h"
 #include "share/ob_rpc_struct.h"
 #include "share/ob_debug_sync_point.h"
 #include "sql/resolver/ddl/ob_fts_index_builder_util.h"
@@ -37,6 +39,98 @@ using namespace oceanbase::share::schema;
 using namespace oceanbase::rootserver;
 
 
+
+// Persist one __all_ai_column row for every AI column of @table_schema. The rows
+// are written with @sql_client, i.e. inside the DDL transaction of the creating
+// statement, so table metadata and AI column metadata become visible atomically.
+static int refresh_ai_column_meta_rows(const ObTableSchema &table_schema,
+                                      oceanbase::common::ObISQLClient &sql_client)
+{
+  int ret = OB_SUCCESS;
+  const bool has_ai_column = [&table_schema]() {
+    bool found = false;
+    for (ObTableSchema::const_column_iterator it = table_schema.column_begin();
+         !found && it != table_schema.column_end(); ++it) {
+      found = (NULL != *it) && (*it)->is_ai_column();
+    }
+    return found;
+  }();
+  LOG_DEBUG("refresh ai column meta rows", K(table_schema.get_table_id()),
+            K(table_schema.get_table_name_str()), K(has_ai_column));
+  if (!has_ai_column) {
+    // nothing to do
+  } else {
+    ObSqlString del_sql;
+    int64_t del_affected_rows = 0;
+    if (OB_FAIL(del_sql.assign_fmt("DELETE FROM %s WHERE table_id = %lu",
+                                   OB_ALL_AI_COLUMN_TNAME, table_schema.get_table_id()))) {
+      LOG_WARN("build delete ai column metadata sql failed", K(ret));
+    } else if (OB_FAIL(sql_client.write(del_sql.ptr(), del_affected_rows))) {
+      LOG_WARN("delete ai column metadata failed", K(ret), K(table_schema.get_table_id()));
+    }
+    const char *hidden_suffixes[3] = {"__ai_state", "__ai_request", "__ai_result_spec"};
+    for (ObTableSchema::const_column_iterator it = table_schema.column_begin();
+         OB_SUCC(ret) && it != table_schema.column_end(); ++it) {
+      const ObColumnSchemaV2 *col = *it;
+      if (OB_ISNULL(col)) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("null ai column schema", K(ret));
+      } else if (!col->is_ai_column()) {
+        // do nothing
+      } else {
+        ObAiColumnMeta meta;
+        uint64_t hidden_ids[3] = {0, 0, 0};
+        const ObString col_name = col->get_column_name_str();
+        if (OB_FAIL(ObAiColumnMeta::unpack(col->get_ai_column_meta(), meta))) {
+          LOG_WARN("unpack ai column metadata failed", K(ret), K(col_name));
+        }
+        for (int64_t i = 0; OB_SUCC(ret) && i < 3; ++i) {
+          char name_buf[OB_MAX_COLUMN_NAME_LENGTH + 32];
+          int64_t pos = 0;
+          if (OB_FAIL(databuff_printf(name_buf, sizeof(name_buf), pos, "%.*s%s",
+                                      col_name.length(), col_name.ptr(), hidden_suffixes[i]))) {
+            LOG_WARN("build ai hidden column name failed", K(ret));
+          } else {
+            const ObColumnSchemaV2 *hidden_col =
+                table_schema.get_column_schema(ObString(static_cast<int32_t>(pos), name_buf));
+            if (OB_ISNULL(hidden_col)) {
+              ret = OB_ERR_UNEXPECTED;
+              LOG_WARN("ai hidden column not found", K(ret), K(col_name), K(hidden_suffixes[i]));
+            } else {
+              hidden_ids[i] = hidden_col->get_column_id();
+            }
+          }
+        }
+        if (OB_SUCC(ret)) {
+          ObDMLSqlSplicer dml;
+          ObSqlString sql;
+          int64_t affected_rows = 0;
+          if (OB_FAIL(dml.add_pk_column("table_id", table_schema.get_table_id()))) {
+          } else if (OB_FAIL(dml.add_pk_column("column_id", col->get_column_id()))) {
+          } else if (OB_FAIL(dml.add_column("column_name", ObHexEscapeSqlStr(col_name)))) {
+          } else if (OB_FAIL(dml.add_column("state_column_id", hidden_ids[0]))) {
+          } else if (OB_FAIL(dml.add_column("request_column_id", hidden_ids[1]))) {
+          } else if (OB_FAIL(dml.add_column("result_spec_column_id", hidden_ids[2]))) {
+          } else if (OB_FAIL(dml.add_column("max_retries", meta.max_retries_))) {
+          } else if (OB_FAIL(dml.add_column("sync_mode", ObHexEscapeSqlStr(meta.sync_mode_)))) {
+          } else if (OB_FAIL(dml.add_column("normalized_expr", ObHexEscapeSqlStr(meta.normalized_expr_)))) {
+          } else if (OB_FAIL(dml.add_column("model_name", ObHexEscapeSqlStr(meta.model_name_)))) {
+          } else if (OB_FAIL(dml.add_column("func_type", meta.func_type_))) {
+          } else if (OB_FAIL(dml.add_column("result_type", meta.result_type_))) {
+          } else if (OB_FAIL(dml.add_column("vector_dim", meta.vector_dim_))) {
+          } else if (OB_FAIL(dml.splice_insert_sql(OB_ALL_AI_COLUMN_TNAME, sql))) {
+          } else if (OB_FAIL(sql_client.write(sql.ptr(), affected_rows))) {
+            LOG_WARN("write ai column metadata failed", K(ret), K(table_schema.get_table_id()));
+          } else if (1 != affected_rows) {
+            ret = OB_ERR_UNEXPECTED;
+            LOG_WARN("unexpected affected rows of ai column metadata", K(ret), K(affected_rows));
+          }
+        }
+      }
+    }
+  }
+  return ret;
+}
 
 ObTableHelper::ObTableHelper(
   share::schema::ObMultiVersionSchemaService *schema_service,
@@ -210,6 +304,13 @@ int ObTableHelper::create_tables_(const ObString *ddl_stmt_str)
                 get_trans_(),
                 ddl_stmt_str,
                 true/*sync_schema_version_for_last_table*/))) {
+    } else {
+      for (int64_t i = 0; OB_SUCC(ret) && i < new_tables_.count(); i++) {
+        ObTableSchema &new_table = new_tables_.at(i);
+        if (OB_FAIL(refresh_ai_column_meta_rows(new_table, get_trans_()))) {
+          LOG_WARN("refresh ai column metadata failed", K(ret), K(new_table.get_table_id()));
+        }
+      }
     }
   }
   return ret;

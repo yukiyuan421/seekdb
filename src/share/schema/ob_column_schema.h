@@ -50,6 +50,61 @@ const char *const STR_COLUMN_TYPE_RAW = "raw";
 const char *const STR_COLUMN_TYPE_UNKNOWN = "unknown";
 
 class ObTableSchema;
+
+// Metadata of one AI column (a column declared as
+//   <col> <type> AI COLUMN (<ai_func_call>) WITH (sync_mode='async', max_retries=N)
+// The structure is packed into ObColumnSchemaV2::ai_column_meta_ as a compact,
+// length-prefixed string so that it survives schema (de)serialization.
+struct ObAiColumnMeta
+{
+  static const int64_t FUNC_AI_COMPLETE = 1;
+  static const int64_t FUNC_AI_EMBED = 2;
+
+  ObAiColumnMeta()
+    : func_type_(0),
+      max_retries_(0),
+      result_type_(0),
+      vector_dim_(0)
+  {}
+
+  void reset()
+  {
+    func_type_ = 0;
+    max_retries_ = 0;
+    result_type_ = 0;
+    vector_dim_ = 0;
+    model_name_.reset();
+    sync_mode_.reset();
+    normalized_expr_.reset();
+    deps_.reset();
+  }
+
+  bool is_valid() const
+  {
+    return FUNC_AI_COMPLETE == func_type_ || FUNC_AI_EMBED == func_type_;
+  }
+
+  TO_STRING_KV(K_(func_type), K_(max_retries), K_(result_type), K_(vector_dim),
+               K_(model_name), K_(sync_mode), K_(normalized_expr), K_(deps));
+
+  int64_t func_type_;
+  int64_t max_retries_;
+  int64_t result_type_;
+  int64_t vector_dim_;
+  common::ObString model_name_;
+  common::ObString sync_mode_;
+  common::ObString normalized_expr_;
+  // Comma separated list of base-column names this AI column depends on.
+  common::ObString deps_;
+
+  // Serialize into a length prefixed text form:
+  //   <func>;<max_retries>;<result_type>;<vector_dim>;
+  //   <len>:<model>;<len>:<sync_mode>;<len>:<normalized_expr>;<len>:<deps>
+  static int pack(const ObAiColumnMeta &meta, char *buf, const int64_t buf_len, int64_t &pos);
+  // The ObString fields of @meta point into @data, the caller must keep @data alive.
+  static int unpack(const common::ObString &data, ObAiColumnMeta &meta);
+};
+
 class ObColumnSchemaV2 : public ObSchema
 {
   OB_UNIS_VERSION_V(1);
@@ -141,6 +196,9 @@ int assign(const ObColumnSchemaV2 &src_schema);
   inline int set_column_name(const common::ObString &col_name) { return deep_copy_str(col_name, column_name_); }
   inline int set_comment(const char *comment) { return deep_copy_str(comment, comment_); }
   inline int set_comment(const common::ObString &comment) { return deep_copy_str(comment, comment_); }
+  inline int set_ai_column_meta(const common::ObString &meta) { return deep_copy_str(meta, ai_column_meta_); }
+  inline const common::ObString &get_ai_column_meta() const { return ai_column_meta_; }
+  inline bool is_ai_column() const { return !ai_column_meta_.empty(); }
   inline void set_on_update_current_timestamp(const bool is_on_update_for_timestamp) { on_update_current_timestamp_ = is_on_update_for_timestamp; }
   int set_extended_type_info(const common::ObIArray<common::ObString> &info);
   int add_type_info(const common::ObString &type_info);
@@ -380,6 +438,10 @@ private:
   common::ObObj cur_default_value_; //collation must be same with the column
   common::ObString column_name_;
   common::ObString comment_;
+  // AI column metadata, packed as a JSON string. Empty for non-AI columns.
+  // Encoded fields: model_name, func_type, result_type, vector_dim, max_retries,
+  // sync_mode, normalized_expr, state_column_id, request_column_id, result_spec_column_id.
+  common::ObString ai_column_meta_;
   common::ObArrayHelper<common::ObString> extended_type_info_;//used for enum and set
   uint64_t prev_column_id_;
   uint64_t next_column_id_;

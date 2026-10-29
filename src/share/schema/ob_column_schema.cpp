@@ -27,6 +27,116 @@ namespace share
 namespace schema
 {
 
+namespace
+{
+// Read a decimal integer from [p, end). On success @p is advanced past it.
+int ai_meta_read_int(const char *&p, const char *end, int64_t &v)
+{
+  int ret = OB_SUCCESS;
+  bool neg = false;
+  if (OB_ISNULL(p) || OB_UNLIKELY(p >= end)) {
+    ret = OB_INVALID_ARGUMENT;
+  } else {
+    if ('-' == *p) {
+      neg = true;
+      ++p;
+    }
+    int64_t val = 0;
+    const char *start = p;
+    while (p < end && *p >= '0' && *p <= '9') {
+      val = val * 10 + (*p - '0');
+      ++p;
+    }
+    if (p == start) {
+      ret = OB_INVALID_ARGUMENT;
+    } else {
+      v = neg ? -val : val;
+    }
+  }
+  return ret;
+}
+
+int ai_meta_pack_str(char *buf, const int64_t buf_len, int64_t &pos, const ObString &s)
+{
+  int ret = OB_SUCCESS;
+  if (0 == s.length() || NULL == s.ptr()) {
+    ret = databuff_printf(buf, buf_len, pos, "0:");
+  } else {
+    ret = databuff_printf(buf, buf_len, pos, "%d:%.*s", s.length(), s.length(), s.ptr());
+  }
+  return ret;
+}
+
+int ai_meta_unpack_str(const char *&p, const char *end, ObString &s)
+{
+  int ret = OB_SUCCESS;
+  int64_t len = 0;
+  if (OB_FAIL(ai_meta_read_int(p, end, len))) {
+  } else if (OB_UNLIKELY(len < 0 || p >= end || ':' != *p)) {
+    ret = OB_INVALID_ARGUMENT;
+  } else if (OB_UNLIKELY(p + 1 + len > end)) {
+    ret = OB_INVALID_ARGUMENT;
+  } else {
+    ++p;
+    s.assign_ptr(p, static_cast<int32_t>(len));
+    p += len;
+  }
+  return ret;
+}
+} // anonymous namespace
+
+int ObAiColumnMeta::pack(const ObAiColumnMeta &meta, char *buf, const int64_t buf_len, int64_t &pos)
+{
+  int ret = OB_SUCCESS;
+  if (OB_ISNULL(buf) || OB_UNLIKELY(buf_len <= 0)) {
+    ret = OB_INVALID_ARGUMENT;
+  } else if (OB_FAIL(databuff_printf(buf, buf_len, pos, "%ld;%ld;%ld;%ld;",
+             meta.func_type_, meta.max_retries_, meta.result_type_, meta.vector_dim_))) {
+  } else if (OB_FAIL(ai_meta_pack_str(buf, buf_len, pos, meta.model_name_))) {
+  } else if (OB_FAIL(databuff_printf(buf, buf_len, pos, ";"))) {
+  } else if (OB_FAIL(ai_meta_pack_str(buf, buf_len, pos, meta.sync_mode_))) {
+  } else if (OB_FAIL(databuff_printf(buf, buf_len, pos, ";"))) {
+  } else if (OB_FAIL(ai_meta_pack_str(buf, buf_len, pos, meta.normalized_expr_))) {
+  } else if (OB_FAIL(databuff_printf(buf, buf_len, pos, ";"))) {
+  } else if (OB_FAIL(ai_meta_pack_str(buf, buf_len, pos, meta.deps_))) {
+  }
+  return ret;
+}
+
+int ObAiColumnMeta::unpack(const ObString &data, ObAiColumnMeta &meta)
+{
+  int ret = OB_SUCCESS;
+  meta.reset();
+  const char *p = data.ptr();
+  const char *end = NULL == p ? p : p + data.length();
+  int64_t vals[4] = {0, 0, 0, 0};
+  for (int64_t i = 0; OB_SUCC(ret) && i < 4; ++i) {
+    if (OB_FAIL(ai_meta_read_int(p, end, vals[i]))) {
+    } else if (OB_UNLIKELY(p >= end || ';' != *p)) {
+      ret = OB_INVALID_ARGUMENT;
+    } else {
+      ++p;
+    }
+  }
+  ObString *fields[4] = {&meta.model_name_, &meta.sync_mode_, &meta.normalized_expr_, &meta.deps_};
+  for (int64_t i = 0; OB_SUCC(ret) && i < 4; ++i) {
+    if (OB_FAIL(ai_meta_unpack_str(p, end, *fields[i]))) {
+    } else if (i < 3) {
+      if (OB_UNLIKELY(p >= end || ';' != *p)) {
+        ret = OB_INVALID_ARGUMENT;
+      } else {
+        ++p;
+      }
+    }
+  }
+  if (OB_SUCC(ret)) {
+    meta.func_type_ = vals[0];
+    meta.max_retries_ = vals[1];
+    meta.result_type_ = vals[2];
+    meta.vector_dim_ = vals[3];
+  }
+  return ret;
+}
 
 ObColumnSchemaV2::ObColumnSchemaV2()
     : ObSchema(),
@@ -82,6 +192,7 @@ int ObColumnSchemaV2::assign(const ObColumnSchemaV2 &src_schema)
     } else if (OB_FAIL(deep_copy_obj(src_schema.cur_default_value_, cur_default_value_))) {
     } else if (OB_FAIL(deep_copy_str(src_schema.column_name_, column_name_))) {
     } else if (OB_FAIL(deep_copy_str(src_schema.comment_, comment_))) {
+    } else if (OB_FAIL(deep_copy_str(src_schema.ai_column_meta_, ai_column_meta_))) {
     } else if (OB_FAIL(set_extended_type_info(src_schema.extended_type_info_))) {
     } else if (src_schema.column_ref_idxs_ != NULL) {
       if (OB_FAIL(alloc_column_ref_set())) {
@@ -120,6 +231,7 @@ int64_t ObColumnSchemaV2::get_convert_size() const
   convert_size += cur_default_value_.get_deep_copy_size();
   convert_size += column_name_.length() + 1;
   convert_size += comment_.length() + 1;
+  convert_size += ai_column_meta_.length() + 1;
   if (column_ref_idxs_ != NULL) {
     convert_size += sizeof(ColumnReferenceSet);
   }
@@ -176,6 +288,7 @@ void ObColumnSchemaV2::reset()
   cur_default_value_.reset();
   column_name_.reset();
   comment_.reset();
+  ai_column_meta_.reset();
   column_flags_ = NON_CASCADE_FLAG;
   column_ref_idxs_ = NULL;
   prev_column_id_ = UINT64_MAX;
@@ -216,6 +329,7 @@ OB_DEF_SERIALIZE(ObColumnSchemaV2)
               cur_default_value_,
               column_name_,
               comment_,
+              ai_column_meta_,
               column_flags_,
               has_column_ref);
   if (OB_SUCC(ret) && has_column_ref) {
@@ -248,6 +362,7 @@ OB_DEF_DESERIALIZE(ObColumnSchemaV2)
   ObObj cur_default_value;
   ObString column_name;
   ObString comment;
+  ObString ai_column_meta;
   bool has_column_ref = false;
 
   LST_DO_CODE(OB_UNIS_DECODE,
@@ -271,6 +386,7 @@ OB_DEF_DESERIALIZE(ObColumnSchemaV2)
               cur_default_value,
               column_name,
               comment,
+              ai_column_meta,
               column_flags_,
               has_column_ref);
   if (OB_SUCC(ret) && has_column_ref) {
@@ -288,6 +404,7 @@ OB_DEF_DESERIALIZE(ObColumnSchemaV2)
   } else if (OB_FAIL(deep_copy_obj(cur_default_value, cur_default_value_))) {
   } else if (OB_FAIL(deep_copy_str(column_name, column_name_))) {
   } else if (OB_FAIL(deep_copy_str(comment, comment_))) {
+  } else if (OB_FAIL(deep_copy_str(ai_column_meta, ai_column_meta_))) {
   } else {
     LST_DO_CODE(OB_UNIS_DECODE,
                 srs_id_,
@@ -325,6 +442,7 @@ OB_DEF_SERIALIZE_SIZE(ObColumnSchemaV2)
               cur_default_value_,
               column_name_,
               comment_,
+              ai_column_meta_,
               column_flags_,
               has_column_ref);
   if (has_column_ref) {
@@ -398,6 +516,7 @@ int64_t ObColumnSchemaV2::to_string(char *buf, const int64_t buf_len) const
     K_(cur_default_value),
     K_(column_name),
     K_(comment),
+    K_(ai_column_meta),
     K_(column_flags),
     K_(extended_type_info),
     K_(prev_column_id),

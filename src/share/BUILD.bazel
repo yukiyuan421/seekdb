@@ -527,6 +527,7 @@ seekdb_semantic_unity_cc_library(
         "//src/oblib:oblib_compression",
         "//src/oblib:oblib_foundation",
         "//src/oblib:oblib_mysql_client_domain",
+        "//src/oblib:oblib_mysql_client_services",
         "//rust:config_headers",
     ],
     implementation_deps = [
@@ -534,6 +535,7 @@ seekdb_semantic_unity_cc_library(
         ":cluster_version_interface",
         ":error_codes",
         ":io",
+        ":local_storage_interface",
         ":resource_limit_interface",
         ":sql_persistence_support",
         ":task_control",
@@ -1644,7 +1646,7 @@ _SHARE_RUNTIME_DEPS = [
 _SHARE_RUNTIME_SEMANTIC_DEPS = [
     dep
     for dep in _SHARE_RUNTIME_DEPS
-    if dep.startswith(":") and not dep.startswith(":_generated_")
+    if dep.startswith(":") and not dep.startswith(":_generated_") and dep != ":local_table_schema"
 ]
 
 _SHARE_RUNTIME_OBLIB_DEPS = [

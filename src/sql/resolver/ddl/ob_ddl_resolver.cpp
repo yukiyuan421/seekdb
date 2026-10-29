@@ -2286,6 +2286,11 @@ int ObDDLResolver::resolve_normal_column_attribute(ObColumnSchemaV2 &column,
       {
         break;
       }
+      case T_AI_COLUMN: {
+        if (OB_FAIL(resolve_ai_column_attribute(column, attr_node, resolve_stat))) {
+        }
+        break;
+      }
       default:  // won't be here
         ret = OB_ERR_PARSER_SYNTAX;
         SQL_RESV_LOG(WARN, "Wrong column attribute", K(ret), K(attr_node->type_));
@@ -2514,6 +2519,307 @@ int ObDDLResolver::resolve_srid_node(share::schema::ObColumnSchemaV2 &column,
     }
   }
 
+  return ret;
+}
+
+namespace ai_column_resolve_helper
+{
+
+// Best effort rendering of a parse-tree expression back to SQL text. Only the
+// node kinds reachable from an AI COLUMN expression are supported.
+int render_expr_text(const ParseNode *node, char *buf, const int64_t buf_len, int64_t &pos)
+{
+  int ret = OB_SUCCESS;
+  if (OB_ISNULL(node)) {
+    // nothing to render
+  } else if (T_FUN_SYS == node->type_) {
+    // Function call: children_[0] is the function name, children_[1] is a
+    // T_EXPR_LIST whose children are the actual arguments.
+    ParseNode *params = NULL;
+    if (OB_ISNULL(node->children_) || OB_UNLIKELY(node->num_child_ < 2)
+        || OB_ISNULL(node->children_[0])) {
+      ret = OB_ERR_UNEXPECTED;
+    } else if (OB_FAIL(databuff_printf(buf, buf_len, pos, "%.*s(",
+                       static_cast<int>(node->children_[0]->str_len_),
+                       node->children_[0]->str_value_))) {
+    } else {
+      params = node->children_[1];
+      if (NULL != params && params->num_child_ > 0 && NULL != params->children_) {
+        for (int32_t i = 0; OB_SUCC(ret) && i < params->num_child_; ++i) {
+          if (i > 0 && OB_FAIL(databuff_printf(buf, buf_len, pos, ", "))) {
+          } else if (OB_FAIL(render_expr_text(params->children_[i], buf, buf_len, pos))) {
+          }
+        }
+      }
+      if (OB_SUCC(ret) && OB_FAIL(databuff_printf(buf, buf_len, pos, ")"))) {
+      }
+    }
+  } else if (T_EXPR_LIST == node->type_) {
+    for (int32_t i = 0; OB_SUCC(ret) && NULL != node->children_ && i < node->num_child_; ++i) {
+      if (i > 0 && OB_FAIL(databuff_printf(buf, buf_len, pos, ", "))) {
+      } else if (OB_FAIL(render_expr_text(node->children_[i], buf, buf_len, pos))) {
+      }
+    }
+  } else if (T_COLUMN_REF == node->type_) {
+    if (OB_ISNULL(node->children_) || OB_UNLIKELY(node->num_child_ < 3)
+        || OB_ISNULL(node->children_[2])) {
+      ret = OB_ERR_UNEXPECTED;
+    } else if (OB_FAIL(databuff_printf(buf, buf_len, pos, "%.*s",
+                       static_cast<int>(node->children_[2]->str_len_),
+                       node->children_[2]->str_value_))) {
+    }
+  } else if (T_VARCHAR == node->type_) {
+    if (OB_FAIL(databuff_printf(buf, buf_len, pos, "'%.*s'",
+                                static_cast<int>(node->str_len_), node->str_value_))) {
+    }
+  } else if (NULL != node->str_value_ && node->str_len_ > 0) {
+    if (OB_FAIL(databuff_printf(buf, buf_len, pos, "%.*s",
+                                static_cast<int>(node->str_len_), node->str_value_))) {
+    }
+  } else if (OB_FAIL(databuff_printf(buf, buf_len, pos, "?"))) {
+  }
+  return ret;
+}
+
+// Collect the base column names referenced by an expression.
+int collect_dep_columns(const ParseNode *node, common::ObIArray<common::ObString> &deps)
+{
+  int ret = OB_SUCCESS;
+  if (OB_ISNULL(node)) {
+    // nothing
+  } else if (T_COLUMN_REF == node->type_) {
+    if (NULL != node->children_ && node->num_child_ >= 3 && NULL != node->children_[2]) {
+      common::ObString name(static_cast<int32_t>(node->children_[2]->str_len_),
+                            node->children_[2]->str_value_);
+      bool found = false;
+      for (int64_t i = 0; !found && i < deps.count(); ++i) {
+        found = (deps.at(i) == name);
+      }
+      if (!found && OB_FAIL(deps.push_back(name))) {
+      }
+    }
+  } else if (NULL != node->children_) {
+    for (int32_t i = 0; OB_SUCC(ret) && i < node->num_child_; ++i) {
+      if (OB_FAIL(collect_dep_columns(node->children_[i], deps))) {
+      }
+    }
+  }
+  return ret;
+}
+
+int read_int_node(const ParseNode *node, int64_t &value)
+{
+  int ret = OB_SUCCESS;
+  if (OB_ISNULL(node)) {
+    ret = OB_ERR_UNEXPECTED;
+  } else if (T_INT == node->type_) {
+    value = node->value_;
+  } else if (NULL != node->str_value_ && node->str_len_ > 0) {
+    int err = 0;
+    value = static_cast<int64_t>(common::ObCharset::strntoull(node->str_value_,
+                                                             static_cast<int32_t>(node->str_len_),
+                                                             10, &err));
+    if (0 != err) {
+      ret = OB_ERR_UNEXPECTED;
+    }
+  } else {
+    ret = OB_ERR_UNEXPECTED;
+  }
+  return ret;
+}
+
+} // namespace ai_column_resolve_helper
+
+int ObDDLResolver::resolve_ai_column_attribute(share::schema::ObColumnSchemaV2 &column,
+                                               ParseNode *attr_node,
+                                               ObColumnResolveStat &resolve_stat)
+{
+  int ret = OB_SUCCESS;
+  ParseNode *expr_node = NULL;
+  ParseNode *with_node = NULL;
+  if (OB_ISNULL(attr_node) || T_AI_COLUMN != attr_node->type_) {
+    ret = OB_INVALID_ARGUMENT;
+    SQL_RESV_LOG(WARN, "invalid ai column attribute node", K(ret));
+  } else if (OB_UNLIKELY(attr_node->num_child_ != 2)
+             || OB_ISNULL(expr_node = attr_node->children_[0])) {
+    ret = OB_ERR_UNEXPECTED;
+    SQL_RESV_LOG(WARN, "invalid ai column node child", K(ret), K(attr_node->num_child_));
+  } else {
+    with_node = attr_node->children_[1];
+    // The parser produces a generic T_FUN_SYS node for function calls; the AI
+    // function kind has to be identified by the function name.
+    ParseNode *params = NULL;
+    if (OB_UNLIKELY(T_FUN_SYS != expr_node->type_)
+        || OB_ISNULL(expr_node->children_)
+        || OB_UNLIKELY(expr_node->num_child_ < 2)
+        || OB_ISNULL(expr_node->children_[0])
+        || OB_ISNULL(params = expr_node->children_[1])
+        || OB_UNLIKELY(params->num_child_ < 2)
+        || OB_ISNULL(params->children_)) {
+      ret = OB_NOT_SUPPORTED;
+      LOG_USER_ERROR(OB_NOT_SUPPORTED, "AI COLUMN requires an ai_complete/ai_embed call");
+      SQL_RESV_LOG(WARN, "invalid ai column expression", K(ret));
+    } else {
+      common::ObString func_name(static_cast<int32_t>(expr_node->children_[0]->str_len_),
+                                 expr_node->children_[0]->str_value_);
+      int64_t ai_func_type = 0;
+      if (0 == func_name.case_compare("ai_complete")) {
+        ai_func_type = ObAiColumnMeta::FUNC_AI_COMPLETE;
+      } else if (0 == func_name.case_compare("ai_embed")) {
+        ai_func_type = ObAiColumnMeta::FUNC_AI_EMBED;
+      } else {
+        ret = OB_NOT_SUPPORTED;
+        LOG_USER_ERROR(OB_NOT_SUPPORTED, "only ai_complete/ai_embed can define an AI COLUMN");
+        SQL_RESV_LOG(WARN, "unsupported ai column function", K(ret), K(func_name));
+      }
+
+      // The first argument is the (logical) model name, a string literal.
+      common::ObString model_name;
+      ParseNode *model_node = params->children_[0];
+      if (OB_FAIL(ret)) {
+        // do nothing
+      } else if (OB_ISNULL(model_node) || T_VARCHAR != model_node->type_) {
+        ret = OB_NOT_SUPPORTED;
+        LOG_USER_ERROR(OB_NOT_SUPPORTED, "AI COLUMN model name must be a string literal");
+        SQL_RESV_LOG(WARN, "invalid ai column model name", K(ret));
+      } else {
+        model_name.assign_ptr(model_node->str_value_, static_cast<int32_t>(model_node->str_len_));
+      }
+
+      // AI_EMBED must be declared on a vector(N) column.
+      int64_t declared_dim = 0;
+      if (OB_SUCC(ret) && ObAiColumnMeta::FUNC_AI_EMBED == ai_func_type) {
+        if (OB_FAIL(ObVectorIndexUtil::get_vector_dim_from_extend_type_info(
+                    column.get_extended_type_info(), declared_dim))
+            || declared_dim <= 0) {
+          ret = OB_NOT_SUPPORTED;
+          LOG_USER_ERROR(OB_NOT_SUPPORTED, "AI_EMBED AI COLUMN must be declared on a vector column");
+          SQL_RESV_LOG(WARN, "ai embed column is not a vector column", K(ret), K(declared_dim));
+        }
+      }
+
+      // WITH (sync_mode = 'async', max_retries = N)
+      common::ObString sync_mode = common::ObString::make_string("async");
+      int64_t max_retries = 0;
+      if (OB_SUCC(ret) && NULL != with_node) {
+        common::ObSEArray<ParseNode *, 4> opt_nodes;
+        ParseNode *cur = with_node;
+        while (NULL != cur && OB_SUCC(ret)) {
+          if (T_AI_COLUMN_OPTION == cur->type_) {
+            if (OB_FAIL(opt_nodes.push_back(cur))) {
+              SQL_RESV_LOG(WARN, "push ai column option failed", K(ret));
+            }
+            cur = NULL;
+          } else if (T_LINK_NODE == cur->type_) {
+            ParseNode *opt = (cur->num_child_ > 1) ? cur->children_[1] : NULL;
+            if (NULL != opt && OB_FAIL(opt_nodes.push_back(opt))) {
+              SQL_RESV_LOG(WARN, "push ai column option failed", K(ret));
+            }
+            cur = (cur->num_child_ > 0) ? cur->children_[0] : NULL;
+          } else {
+            cur = NULL;
+          }
+        }
+        for (int64_t i = 0; OB_SUCC(ret) && i < opt_nodes.count(); ++i) {
+          ParseNode *opt = opt_nodes.at(i);
+          if (OB_UNLIKELY(opt->num_child_ != 3) || OB_ISNULL(opt->children_[0])) {
+            ret = OB_ERR_UNEXPECTED;
+            SQL_RESV_LOG(WARN, "invalid ai column option", K(ret));
+          } else {
+            common::ObString opt_name(static_cast<int32_t>(opt->children_[0]->str_len_),
+                                      opt->children_[0]->str_value_);
+            ParseNode *opt_val = opt->children_[2];
+            if (NULL == opt_val) {
+              // ignore empty option value
+            } else if (0 == opt_name.case_compare("sync_mode")) {
+              sync_mode.assign_ptr(opt_val->str_value_, static_cast<int32_t>(opt_val->str_len_));
+            } else if (0 == opt_name.case_compare("max_retries")) {
+              if (OB_FAIL(ai_column_resolve_helper::read_int_node(opt_val, max_retries))) {
+                SQL_RESV_LOG(WARN, "invalid max_retries option", K(ret));
+              }
+            }
+          }
+        }
+      }
+
+      // AI_EMBED(model, text[, dim]): declared vector(N) must match dim.
+      if (OB_SUCC(ret) && ObAiColumnMeta::FUNC_AI_EMBED == ai_func_type
+          && params->num_child_ > 2 && NULL != params->children_[2]) {
+        int64_t arg_dim = 0;
+        if (OB_FAIL(ai_column_resolve_helper::read_int_node(params->children_[2], arg_dim))) {
+          SQL_RESV_LOG(WARN, "invalid ai embed dimension argument", K(ret));
+        } else if (arg_dim != declared_dim) {
+          ret = OB_ERR_INVALID_VECTOR_DIM;
+          LOG_USER_ERROR(OB_ERR_INVALID_VECTOR_DIM,
+                         static_cast<uint32_t>(declared_dim), static_cast<uint32_t>(arg_dim));
+          SQL_RESV_LOG(WARN, "ai embed dimension mismatch", K(ret), K(arg_dim), K(declared_dim));
+        }
+      }
+
+      if (OB_SUCC(ret)) {
+        char expr_buf[4096];
+        int64_t expr_pos = 0;
+        common::ObSEArray<common::ObString, 8> deps;
+        if (OB_FAIL(ai_column_resolve_helper::render_expr_text(expr_node, expr_buf, sizeof(expr_buf), expr_pos))) {
+          SQL_RESV_LOG(WARN, "render ai column expression failed", K(ret));
+        } else if (OB_FAIL(ai_column_resolve_helper::collect_dep_columns(params->children_[1], deps))) {
+          SQL_RESV_LOG(WARN, "collect ai column dependencies failed", K(ret));
+        } else {
+          // Typed result contract: the model must be told which SQL type the
+          // result column expects. The instruction is persisted as part of the
+          // normalized expression so that workers can replay it.
+          const char *type_prompt = NULL;
+          if (ob_is_json(column.get_data_type())) {
+            type_prompt = "Return exactly one valid JSON value and nothing else.";
+          } else if (ob_is_integer_type(column.get_data_type())) {
+            type_prompt = "Return the result as a single base-10 integer and nothing else.";
+          }
+          char norm_buf[8192];
+          int64_t norm_pos = 0;
+          if (OB_FAIL(databuff_printf(norm_buf, sizeof(norm_buf), norm_pos, "%.*s",
+                                      static_cast<int>(expr_pos), expr_buf))) {
+          } else if (NULL != type_prompt
+                     && OB_FAIL(databuff_printf(norm_buf, sizeof(norm_buf), norm_pos,
+                                                " [AI_TYPE_PROMPT]%s", type_prompt))) {
+          } else if (norm_pos >= static_cast<int64_t>(sizeof(norm_buf))) {
+            ret = OB_SIZE_OVERFLOW;
+            SQL_RESV_LOG(WARN, "ai column normalized expression is too long", K(ret), K(norm_pos));
+          } else {
+            char dep_buf[2048];
+            int64_t dep_pos = 0;
+            for (int64_t i = 0; OB_SUCC(ret) && i < deps.count(); ++i) {
+              if (OB_FAIL(databuff_printf(dep_buf, sizeof(dep_buf), dep_pos, "%s%.*s",
+                                          i > 0 ? "," : "",
+                                          static_cast<int>(deps.at(i).length()),
+                                          deps.at(i).ptr()))) {
+              }
+            }
+            ObAiColumnMeta meta;
+            meta.func_type_ = ai_func_type;
+            meta.max_retries_ = max_retries;
+            meta.result_type_ = static_cast<int64_t>(column.get_data_type());
+            meta.vector_dim_ = declared_dim;
+            meta.model_name_ = model_name;
+            meta.sync_mode_ = sync_mode;
+            meta.normalized_expr_.assign_ptr(norm_buf, static_cast<int32_t>(norm_pos));
+            if (dep_pos > 0) {
+              meta.deps_.assign_ptr(dep_buf, static_cast<int32_t>(dep_pos));
+            }
+            char meta_buf[16384];
+            int64_t meta_pos = 0;
+            if (OB_FAIL(ObAiColumnMeta::pack(meta, meta_buf, sizeof(meta_buf), meta_pos))) {
+              SQL_RESV_LOG(WARN, "pack ai column meta failed", K(ret));
+            } else if (OB_FAIL(column.set_ai_column_meta(
+                         common::ObString(static_cast<int32_t>(meta_pos), meta_buf)))) {
+              SQL_RESV_LOG(WARN, "set ai column metadata failed", K(ret));
+            } else {
+              resolve_stat.is_ai_column_ = true;
+            }
+          }
+        }
+      }
+    }
+  }
   return ret;
 }
 

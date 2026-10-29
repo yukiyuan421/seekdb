@@ -178,6 +178,8 @@ private:
 
 
   int resolve_pos_column(const ParseNode *node, share::schema::AlterColumnSchema &alter_column_schema);
+  int append_ai_hidden_columns_for_add(const share::schema::AlterColumnSchema &ai_column,
+                                       ObAlterTableStmt *alter_table_stmt);
   int fill_column_schema_according_stat(const ObColumnResolveStat &stat,
                                         share::schema::AlterColumnSchema &alter_column_schema);
   int resolve_partitioned_partition(const ParseNode *node,

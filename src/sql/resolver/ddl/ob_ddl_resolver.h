@@ -75,6 +75,7 @@ struct ObColumnResolveStat
     is_set_null_ = false;
     is_set_not_null_ = false;
     is_set_default_value_ = false;
+    is_ai_column_ = false;
   }
   int64_t to_string(char *buf, const int64_t buf_len) const
   {
@@ -86,7 +87,8 @@ struct ObColumnResolveStat
          K(is_set_null_),
          K(is_set_not_null_),
          K(is_set_default_value_),
-         K(is_unique_key_));
+         K(is_unique_key_),
+         K(is_ai_column_));
     J_OBJ_END();
     return pos;
   }
@@ -97,6 +99,7 @@ struct ObColumnResolveStat
   bool is_set_not_null_;
   bool is_set_default_value_;
   bool is_unique_key_;
+  bool is_ai_column_;
 };
 
 struct ObDefaultValueRes
@@ -547,6 +550,9 @@ protected:
                                          ObColumnResolveStat &reslove_stat);
   int resolve_srid_node(share::schema::ObColumnSchemaV2 &column,
                         const ParseNode &srid_node);
+  int resolve_ai_column_attribute(share::schema::ObColumnSchemaV2 &column,
+                                  ParseNode *attr_node,
+                                  ObColumnResolveStat &resolve_stat);
   int resolve_column_skip_index(
       const ParseNode &skip_index_node,
       share::schema::ObColumnSchemaV2 &column_schema);

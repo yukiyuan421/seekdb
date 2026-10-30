@@ -18,6 +18,10 @@
 
 #include "ob_table_modify_op.h"
 #include <atomic>
+#include <mutex>
+#include <string>
+#include <unordered_map>
+#include <vector>
 #include "lib/string/ob_sql_string.h"
 #include "lib/time/ob_time_utility.h"
 #include "share/schema/ob_column_schema.h"
@@ -1066,6 +1070,83 @@ namespace ai_column_dml_util
 {
 thread_local bool g_ai_column_internal_write = false;
 
+// Task rows created by a still running transaction are invisible to the dedicated
+// metadata connection used by delete_task_rows(), so a DELETE/UPDATE issued in the
+// same transaction as its INSERT could not clean them up. Remember the task ids a
+// transaction wrote, keyed by (transaction id, table id, rowkey predicate), and
+// consume them from the delete path.
+struct AITaskCacheKey
+{
+  int64_t tx_id_;
+  uint64_t table_id_;
+  std::string predicate_;
+  bool operator==(const AITaskCacheKey &other) const
+  {
+    return tx_id_ == other.tx_id_ && table_id_ == other.table_id_
+           && predicate_ == other.predicate_;
+  }
+};
+
+struct AITaskCacheKeyHash
+{
+  size_t operator()(const AITaskCacheKey &key) const
+  {
+    size_t h = std::hash<std::string>()(key.predicate_);
+    h ^= static_cast<size_t>(key.table_id_) + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
+    h ^= static_cast<size_t>(key.tx_id_) + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
+    return h;
+  }
+};
+
+std::mutex g_tx_task_cache_lock;
+std::unordered_map<AITaskCacheKey, std::vector<int64_t>, AITaskCacheKeyHash> g_tx_task_cache;
+
+void remember_tx_task_id(const int64_t tx_id,
+                         const uint64_t table_id,
+                         const common::ObString &predicate,
+                         const int64_t task_id)
+{
+  if (tx_id > 0 && NULL != predicate.ptr() && predicate.length() > 0) {
+    AITaskCacheKey key;
+    key.tx_id_ = tx_id;
+    key.table_id_ = table_id;
+    key.predicate_.assign(predicate.ptr(), static_cast<size_t>(predicate.length()));
+    std::lock_guard<std::mutex> guard(g_tx_task_cache_lock);
+    // The map is only a same-transaction accelerator; bound the memory even if a
+    // transaction never consumed its entries (e.g. committed insert-only work).
+    if (g_tx_task_cache.size() > 8192) {
+      g_tx_task_cache.clear();
+    }
+    g_tx_task_cache[key].push_back(task_id);
+  }
+}
+
+bool take_tx_task_ids(const int64_t tx_id,
+                      const uint64_t table_id,
+                      const common::ObString &predicate,
+                      common::ObIArray<int64_t> &task_ids)
+{
+  bool found = false;
+  if (tx_id > 0 && NULL != predicate.ptr() && predicate.length() > 0) {
+    AITaskCacheKey key;
+    key.tx_id_ = tx_id;
+    key.table_id_ = table_id;
+    key.predicate_.assign(predicate.ptr(), static_cast<size_t>(predicate.length()));
+    std::lock_guard<std::mutex> guard(g_tx_task_cache_lock);
+    auto it = g_tx_task_cache.find(key);
+    if (it != g_tx_task_cache.end()) {
+      for (size_t i = 0; i < it->second.size(); ++i) {
+        if (OB_SUCCESS != task_ids.push_back(it->second[i])) {
+          break;
+        }
+      }
+      g_tx_task_cache.erase(it);
+      found = !task_ids.empty();
+    }
+  }
+  return found;
+}
+
 struct AIColumnInfo
 {
   AIColumnInfo() : column_id_(0), max_retries_(0) {}
@@ -1549,7 +1630,14 @@ int ObTableModifyOp::handle_ai_column_row_processing()
                 common::ObTabletID(task_table.get_table_id()),
                 *tx_desc, execution, column_ids, &iter, affected);
             LOG_INFO("ai col ins stage insert done", K(lret), K(affected));
-            if (OB_SUCCESS != lret) {
+            if (OB_SUCCESS == lret) {
+              const int64_t ins_tx_id = (NULL == session)
+                                            ? 0 : session->get_tx_id_with_thread_data_lock();
+              for (int64_t v = 0; v < values.count(); ++v) {
+                remember_tx_task_id(ins_tx_id, static_cast<uint64_t>(values.at(v).table_id_),
+                                    values.at(v).rowkey_predicate_,
+                                    values.at(v).task_id_);
+              }
             }
           }
         }
@@ -1650,11 +1738,27 @@ int ObTableModifyOp::handle_ai_column_row_processing()
     auto delete_task_rows = [&](const uint64_t table_id,
                                 const common::ObSqlString &predicate) -> int {
       int lret = OB_SUCCESS;
+      ObSQLSessionInfo *del_session = ctx_.get_my_session();
+      const int64_t del_tx_id = (NULL == del_session)
+                                    ? 0 : del_session->get_tx_id_with_thread_data_lock();
+      common::ObSEArray<int64_t, 8> cached_task_ids;
+      if (del_tx_id > 0) {
+        (void)take_tx_task_ids(del_tx_id, table_id, predicate.string(), cached_task_ids);
+      }
+      if (!cached_task_ids.empty()) {
+        // Delete rows this very transaction inserted; the committed metadata view
+        // below cannot see them.
+        lret = delete_task_rows_by_id(cached_task_ids);
+        if (OB_SUCCESS != lret) {
+          LOG_INFO("ai col delete own txn tasks failed", K(lret), K(cached_task_ids.count()));
+        }
+      }
       common::ObMySQLProxy *sql_proxy = ctx_.get_sql_proxy();
       common::ObSqlString select;
       common::ObSEArray<int64_t, 8> task_ids;
       common::ObMySQLProxy::MySQLResult res;
-      if (OB_ISNULL(sql_proxy)) {
+      if (OB_FAIL(lret)) {
+      } else if (OB_ISNULL(sql_proxy)) {
         lret = OB_NOT_INIT;
       } else if (OB_SUCCESS != (lret = select.assign_fmt(
                      "SELECT task_id FROM oceanbase.%s WHERE table_id = %ld"

@@ -60,14 +60,8 @@ static int refresh_ai_column_meta_rows(const ObTableSchema &table_schema,
   if (!has_ai_column) {
     // nothing to do
   } else {
-    ObSqlString del_sql;
-    int64_t del_affected_rows = 0;
-    if (OB_FAIL(del_sql.assign_fmt("DELETE FROM %s WHERE table_id = %lu",
-                                   OB_ALL_AI_COLUMN_TNAME, table_schema.get_table_id()))) {
-      LOG_WARN("build delete ai column metadata sql failed", K(ret));
-    } else if (OB_FAIL(sql_client.write(del_sql.ptr(), del_affected_rows))) {
-      LOG_WARN("delete ai column metadata failed", K(ret), K(table_schema.get_table_id()));
-    }
+    // Rows are upserted per AI column below; columns whose metadata is not
+    // carried by the (refreshed) schema keep their persisted catalog row.
     const char *hidden_suffixes[3] = {"__ai_state", "__ai_request", "__ai_result_spec"};
     for (ObTableSchema::const_column_iterator it = table_schema.column_begin();
          OB_SUCC(ret) && it != table_schema.column_end(); ++it) {
@@ -77,6 +71,8 @@ static int refresh_ai_column_meta_rows(const ObTableSchema &table_schema,
         LOG_WARN("null ai column schema", K(ret));
       } else if (!col->is_ai_column()) {
         // do nothing
+      } else if (col->get_ai_column_meta().empty()) {
+        // metadata is not carried by the refreshed schema; keep catalog row as is
       } else {
         ObAiColumnMeta meta;
         uint64_t hidden_ids[3] = {0, 0, 0};
@@ -104,7 +100,19 @@ static int refresh_ai_column_meta_rows(const ObTableSchema &table_schema,
         if (OB_SUCC(ret)) {
           ObDMLSqlSplicer dml;
           ObSqlString sql;
+          ObSqlString del_sql;
+          ObSqlString norm_expr;
           int64_t affected_rows = 0;
+          int64_t del_affected_rows = 0;
+          if (OB_FAIL(del_sql.assign_fmt(
+                  "DELETE FROM %s WHERE table_id = %lu AND column_id = %lu",
+                  OB_ALL_AI_COLUMN_TNAME, table_schema.get_table_id(),
+                  col->get_column_id()))) {
+            LOG_WARN("build delete ai column metadata sql failed", K(ret));
+          } else if (OB_FAIL(sql_client.write(del_sql.ptr(), del_affected_rows))) {
+            LOG_WARN("delete ai column metadata failed", K(ret),
+                     K(table_schema.get_table_id()), K(col->get_column_id()));
+          }
           if (OB_FAIL(dml.add_pk_column("table_id", table_schema.get_table_id()))) {
           } else if (OB_FAIL(dml.add_pk_column("column_id", col->get_column_id()))) {
           } else if (OB_FAIL(dml.add_column("column_name", ObHexEscapeSqlStr(col_name)))) {
@@ -113,7 +121,10 @@ static int refresh_ai_column_meta_rows(const ObTableSchema &table_schema,
           } else if (OB_FAIL(dml.add_column("result_spec_column_id", hidden_ids[2]))) {
           } else if (OB_FAIL(dml.add_column("max_retries", meta.max_retries_))) {
           } else if (OB_FAIL(dml.add_column("sync_mode", ObHexEscapeSqlStr(meta.sync_mode_)))) {
-          } else if (OB_FAIL(dml.add_column("normalized_expr", ObHexEscapeSqlStr(meta.normalized_expr_)))) {
+          } else if (OB_FAIL(norm_expr.append(meta.normalized_expr_))) {
+          } else if (!meta.deps_.empty() && OB_FAIL(norm_expr.append(" [AI_DEPS]"))) {
+          } else if (!meta.deps_.empty() && OB_FAIL(norm_expr.append(meta.deps_))) {
+          } else if (OB_FAIL(dml.add_column("normalized_expr", ObHexEscapeSqlStr(norm_expr.string())))) {
           } else if (OB_FAIL(dml.add_column("model_name", ObHexEscapeSqlStr(meta.model_name_)))) {
           } else if (OB_FAIL(dml.add_column("func_type", meta.func_type_))) {
           } else if (OB_FAIL(dml.add_column("result_type", meta.result_type_))) {

@@ -198,7 +198,8 @@ int assign(const ObColumnSchemaV2 &src_schema);
   inline int set_comment(const common::ObString &comment) { return deep_copy_str(comment, comment_); }
   inline int set_ai_column_meta(const common::ObString &meta) { return deep_copy_str(meta, ai_column_meta_); }
   inline const common::ObString &get_ai_column_meta() const { return ai_column_meta_; }
-  inline bool is_ai_column() const { return !ai_column_meta_.empty(); }
+  inline bool is_ai_column() const
+  { return (column_flags_ & AI_COLUMN_FLAG) != 0 || !ai_column_meta_.empty(); }
   inline void set_on_update_current_timestamp(const bool is_on_update_for_timestamp) { on_update_current_timestamp_ = is_on_update_for_timestamp; }
   int set_extended_type_info(const common::ObIArray<common::ObString> &info);
   int add_type_info(const common::ObString &type_info);

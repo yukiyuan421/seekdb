@@ -58,6 +58,9 @@ private:
   int check_safe_update_mode(ObUpdateStmt *update_stmt);
   int resolve_update_constraints();
   int generate_batched_stmt_info();
+  // Add implicit NULL assignments for AI result columns whose dependencies (or
+  // rowkey) are touched by this UPDATE, so the DML hook can invalidate them.
+  int invalidate_ai_columns(common::ObIArray<ObTableAssignment> &table_assigns);
 };
 
 } // namespace sql

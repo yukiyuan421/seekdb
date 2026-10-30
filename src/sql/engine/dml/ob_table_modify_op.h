@@ -238,7 +238,8 @@ public:
   bool has_before_row_trigger(const ObDMLBaseCtDef &dml_ctdef) { return dml_ctdef.is_primary_index_ && dml_ctdef.trig_ctdef_.all_tm_points_.has_before_row(); }
   bool has_after_row_trigger(const ObDMLBaseCtDef &dml_ctdef) { return dml_ctdef.is_primary_index_ && dml_ctdef.trig_ctdef_.all_tm_points_.has_after_row(); }
   bool need_foreign_key_check(const ObDMLBaseCtDef &dml_ctdef) { return dml_ctdef.is_primary_index_ && dml_ctdef.fk_args_.count() > 0; }
-  bool need_after_row_process(const ObDMLBaseCtDef &dml_ctdef) { return need_foreign_key_check(dml_ctdef) || has_after_row_trigger(dml_ctdef); }
+  bool dml_table_has_ai_column(const ObDMLBaseCtDef &dml_ctdef);
+  bool need_after_row_process(const ObDMLBaseCtDef &dml_ctdef) { return need_foreign_key_check(dml_ctdef) || has_after_row_trigger(dml_ctdef) || dml_table_has_ai_column(dml_ctdef); }
   void set_execute_single_row() { execute_single_row_ = true; }
   void unset_execute_single_row() { execute_single_row_ = false; }
   bool get_execute_single_row() const { return execute_single_row_; }
@@ -251,6 +252,9 @@ public:
 
   ObDMLModifyRowsList& get_dml_modify_row_list() { return dml_modify_rows_;}
   int submit_all_dml_task();
+  // AI COLUMN maintenance: create __all_ai_column_task rows and invalidate stale
+  // AI results for the rows just written by this DML statement (same transaction).
+  int handle_ai_column_row_processing();
 
   int perform_batch_fk_check();
 protected:

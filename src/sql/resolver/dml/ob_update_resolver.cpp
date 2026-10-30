@@ -90,6 +90,15 @@ int ObUpdateResolver::resolve(const ParseNode &parse_tree)
     }
   }
 
+  // AI COLUMN: invalidate results whose dependencies/rowkey are updated. The
+  // implicit NULL assignment lives in the plan, so every re-execution of the
+  // cached statement invalidates the same way.
+  if (OB_SUCC(ret)) {
+    if (OB_FAIL(invalidate_ai_columns(tables_assign))) {
+      LOG_WARN("invalidate ai columns by update failed", K(ret));
+    }
+  }
+
   if (OB_SUCC(ret)) {
     FOREACH_CNT_X(it, update_stmt->get_table_items(), OB_SUCC(ret)) {
       if (NULL != *it && ((*it)->is_generated_table() || (*it)->is_temp_table())) {
@@ -530,6 +539,197 @@ int ObUpdateResolver::resolve_update_constraints()
           if (OB_FAIL(ObTableAssignment::expand_expr(*params_.expr_factory_,
                                                      table_info->assignments_,
                                                      table_info->view_check_exprs_.at(j)))) {
+          }
+        }
+      }
+    }
+  }
+  return ret;
+}
+
+
+namespace {
+
+// Split a comma separated dependency list into names (no allocation: points into data).
+int append_ai_dep_names(const common::ObString &deps,
+                        common::ObIArray<common::ObString> &names)
+{
+  int ret = OB_SUCCESS;
+  const char *p = deps.ptr();
+  const char *end = (NULL == p) ? p : p + deps.length();
+  while (OB_SUCC(ret) && NULL != p && p < end) {
+    const char *comma = p;
+    while (comma < end && ',' != *comma) {
+      ++comma;
+    }
+    if (comma > p) {
+      common::ObString name(static_cast<int32_t>(comma - p), p);
+      if (OB_FAIL(names.push_back(name))) {
+      }
+    }
+    p = (comma < end) ? comma + 1 : comma;
+  }
+  return ret;
+}
+
+// Dependency columns of one AI column. Prefer the packed ObAiColumnMeta; fall back to
+// the [AI_DEPS] section of the hidden "<col>__ai_state" column comment, which survives
+// every schema refresh.
+int get_ai_column_deps(const share::schema::ObTableSchema &table,
+                       const share::schema::ObColumnSchemaV2 &ai_column,
+                       common::ObIArray<common::ObString> &deps)
+{
+  int ret = OB_SUCCESS;
+  const common::ObString &meta_str = ai_column.get_ai_column_meta();
+  if (!meta_str.empty()) {
+    share::schema::ObAiColumnMeta meta;
+    if (OB_SUCCESS == share::schema::ObAiColumnMeta::unpack(meta_str, meta)
+        && !meta.deps_.empty()) {
+      if (OB_FAIL(append_ai_dep_names(meta.deps_, deps))) {
+      }
+    }
+  }
+  if (OB_SUCC(ret) && deps.empty()) {
+    char name_buf[OB_MAX_COLUMN_NAME_LENGTH + 32];
+    int64_t name_pos = 0;
+    const common::ObString column_name = ai_column.get_column_name_str();
+    if (OB_SUCCESS == databuff_printf(name_buf, sizeof(name_buf), name_pos,
+                                      "%.*s__ai_state",
+                                      static_cast<int>(column_name.length()),
+                                      column_name.ptr())) {
+      const common::ObString hidden_name(static_cast<int32_t>(name_pos), name_buf);
+      const share::schema::ObColumnSchemaV2 *hidden_col = table.get_column_schema(hidden_name);
+      if (NULL != hidden_col) {
+        const common::ObString packed = hidden_col->get_comment_str();
+        static const char deps_marker[] = " [AI_DEPS]";
+        static const char retry_marker[] = " [AI_MAX_RETRIES]";
+        const int64_t deps_marker_len = static_cast<int64_t>(sizeof(deps_marker) - 1);
+        const int64_t retry_marker_len = static_cast<int64_t>(sizeof(retry_marker) - 1);
+        int64_t deps_pos = -1;
+        int64_t retry_pos = -1;
+        for (int64_t i = 0; i + deps_marker_len <= packed.length(); ++i) {
+          if (0 == MEMCMP(packed.ptr() + i, deps_marker, deps_marker_len)) {
+            deps_pos = i;
+            break;
+          }
+        }
+        for (int64_t i = 0; i + retry_marker_len <= packed.length(); ++i) {
+          if (0 == MEMCMP(packed.ptr() + i, retry_marker, retry_marker_len)) {
+            retry_pos = i;
+            break;
+          }
+        }
+        if (deps_pos >= 0) {
+          const int64_t begin = deps_pos + deps_marker_len;
+          const int64_t end = (retry_pos > begin) ? retry_pos : packed.length();
+          if (end > begin) {
+            const common::ObString deps_str(static_cast<int32_t>(end - begin),
+                                            packed.ptr() + begin);
+            if (OB_FAIL(append_ai_dep_names(deps_str, deps))) {
+            }
+          }
+        }
+      }
+    }
+  }
+  return ret;
+}
+
+} // namespace
+
+int ObUpdateResolver::invalidate_ai_columns(ObIArray<ObTableAssignment> &table_assigns)
+{
+  int ret = OB_SUCCESS;
+  ObUpdateStmt *update_stmt = get_update_stmt();
+  if (OB_ISNULL(update_stmt) || OB_ISNULL(schema_checker_)
+      || OB_ISNULL(params_.expr_factory_) || OB_ISNULL(session_info_)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("update resolver is not ready for ai column invalidation", K(ret));
+  } else {
+    for (int64_t i = 0; OB_SUCC(ret) && i < table_assigns.count(); ++i) {
+      ObTableAssignment &table_assign = table_assigns.at(i);
+      const TableItem *table_item = update_stmt->get_table_item_by_id(table_assign.table_id_);
+      const share::schema::ObTableSchema *table_schema = NULL;
+      if (OB_ISNULL(table_item)) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("update table item not found", K(ret), K(table_assign.table_id_));
+      } else if (!table_item->is_basic_table()) {
+        // views / temp tables have no persisted AI columns
+      } else if (OB_FAIL(schema_checker_->get_table_schema(
+                   table_item->get_base_table_item().ref_id_, table_schema))) {
+        LOG_WARN("get update table schema failed", K(ret));
+      } else if (OB_ISNULL(table_schema)) {
+        ret = OB_ERR_UNEXPECTED;
+      } else {
+        common::ObSEArray<uint64_t, 8> assigned_ids;
+        bool rowkey_assigned = false;
+        for (int64_t j = 0; OB_SUCC(ret) && j < table_assign.assignments_.count(); ++j) {
+          const ObColumnRefRawExpr *col_expr = table_assign.assignments_.at(j).column_expr_;
+          if (OB_ISNULL(col_expr)) {
+            ret = OB_ERR_UNEXPECTED;
+          } else {
+            const uint64_t column_id = col_expr->get_column_id();
+            const share::schema::ObColumnSchemaV2 *column =
+                table_schema->get_column_schema(column_id);
+            if (OB_FAIL(add_var_to_array_no_dup(assigned_ids, column_id))) {
+            } else if (NULL != column && column->is_rowkey_column()) {
+              rowkey_assigned = true;
+            }
+          }
+        }
+        for (share::schema::ObTableSchema::const_column_iterator it = table_schema->column_begin();
+             OB_SUCC(ret) && it != table_schema->column_end(); ++it) {
+          const share::schema::ObColumnSchemaV2 *ai_column = *it;
+          if (OB_ISNULL(ai_column)) {
+            ret = OB_ERR_UNEXPECTED;
+          } else if (!ai_column->is_ai_column()) {
+            // not an AI column
+          } else if (has_exist_in_array(assigned_ids, ai_column->get_column_id())) {
+            // user already assigns this AI column explicitly; keep user's expression
+          } else {
+            bool need_invalidate = rowkey_assigned;
+            if (OB_SUCC(ret) && !need_invalidate) {
+              common::ObSEArray<common::ObString, 8> deps;
+              if (OB_FAIL(get_ai_column_deps(*table_schema, *ai_column, deps))) {
+                LOG_WARN("get ai column deps failed", K(ret));
+              }
+              for (int64_t d = 0; OB_SUCC(ret) && !need_invalidate && d < deps.count(); ++d) {
+                const share::schema::ObColumnSchemaV2 *dep_column =
+                    table_schema->get_column_schema(deps.at(d));
+                if (NULL != dep_column
+                    && has_exist_in_array(assigned_ids, dep_column->get_column_id())) {
+                  need_invalidate = true;
+                }
+              }
+            }
+            if (OB_SUCC(ret) && need_invalidate) {
+              common::ObSEArray<ObColumnRefRawExpr *, 1> col_exprs;
+              ColumnItem *column_item = NULL;
+              ObRawExpr *null_expr = NULL;
+              if (OB_FAIL(add_column_to_stmt(*table_item, *ai_column, col_exprs))) {
+              } else if (col_exprs.empty()) {
+                ret = OB_ERR_UNEXPECTED;
+              } else if (OB_ISNULL(column_item = update_stmt->get_column_item_by_id(
+                             table_assign.table_id_, ai_column->get_column_id()))) {
+                ret = OB_ERR_UNEXPECTED;
+              } else if (OB_FAIL(ObRawExprUtils::build_null_expr(
+                             *params_.expr_factory_, null_expr))) {
+              } else if (OB_FAIL(add_additional_function_according_to_type(
+                             column_item, null_expr, T_UPDATE_SCOPE, true))) {
+              } else {
+                ObAssignment assignment;
+                assignment.column_expr_ = column_item->expr_;
+                assignment.expr_ = null_expr;
+                assignment.is_implicit_ = true;
+                if (OB_FAIL(table_assign.assignments_.push_back(assignment))) {
+                } else {
+                  LOG_INFO("ai column result invalidated by update",
+                           K(ret), "table_id", table_assign.table_id_,
+                           "column_id", ai_column->get_column_id(),
+                           "column_name", ai_column->get_column_name_str());
+                }
+              }
+            }
           }
         }
       }

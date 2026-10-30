@@ -2813,6 +2813,7 @@ int ObDDLResolver::resolve_ai_column_attribute(share::schema::ObColumnSchemaV2 &
                          common::ObString(static_cast<int32_t>(meta_pos), meta_buf)))) {
               SQL_RESV_LOG(WARN, "set ai column metadata failed", K(ret));
             } else {
+              column.add_column_flag(AI_COLUMN_FLAG);
               resolve_stat.is_ai_column_ = true;
             }
           }

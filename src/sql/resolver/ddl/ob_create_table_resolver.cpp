@@ -149,6 +149,25 @@ int ObCreateTableResolver::add_ai_column_hidden_cols(
   const char *hidden_suffixes[3] = {"__ai_state", "__ai_request", "__ai_result_spec"};
   ObObjType hidden_types[3] = {ObIntType, ObVarcharType, ObVarcharType};
   const ObString col_name = column.get_column_name_str();
+  // The AI column catalog is not carried by the refreshed column schema, so the
+  // minimal descriptor (normalized expression, dependencies, retry budget) is
+  // packed into the comment of the hidden helper columns. Hidden columns are not
+  // printed by SHOW CREATE TABLE, so this stays internal.
+  char ai_meta_buf[8192];
+  int64_t ai_meta_pos = 0;
+  ObAiColumnMeta ai_column_meta;
+  if (OB_FAIL(ObAiColumnMeta::unpack(column.get_ai_column_meta(), ai_column_meta))) {
+    SQL_RESV_LOG(WARN, "unpack ai column meta failed", K(ret));
+  } else if (OB_FAIL(databuff_printf(ai_meta_buf, sizeof(ai_meta_buf), ai_meta_pos,
+                                     "%.*s [AI_DEPS]%.*s [AI_MAX_RETRIES]%ld",
+                                     ai_column_meta.normalized_expr_.length(),
+                                     ai_column_meta.normalized_expr_.ptr(),
+                                     ai_column_meta.deps_.length(),
+                                     ai_column_meta.deps_.ptr(),
+                                     ai_column_meta.max_retries_))) {
+    SQL_RESV_LOG(WARN, "build ai hidden column comment failed", K(ret));
+  }
+  ObString ai_meta_comment(static_cast<int32_t>(ai_meta_pos), ai_meta_buf);
   char hidden_name_buf[OB_MAX_COLUMN_NAME_LENGTH + 32];
   for (int i = 0; OB_SUCC(ret) && i < 3; ++i) {
     int64_t pos = 0;
@@ -173,6 +192,8 @@ int ObCreateTableResolver::add_ai_column_hidden_cols(
       }
       if (OB_FAIL(hidden_col.set_column_name(ObString(static_cast<int32_t>(pos), hidden_name_buf)))) {
         SQL_RESV_LOG(WARN, "set ai hidden column name failed", K(ret));
+      } else if (OB_FAIL(hidden_col.set_comment(ai_meta_comment))) {
+        SQL_RESV_LOG(WARN, "set ai hidden column comment failed", K(ret));
       } else if (OB_FAIL(resolved_cols.push_back(hidden_col))) {
         SQL_RESV_LOG(WARN, "push ai hidden column failed", K(ret));
       }

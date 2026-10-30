@@ -3480,6 +3480,21 @@ int ObAlterTableResolver::append_ai_hidden_columns_for_add(
   const char *hidden_suffixes[3] = {"__ai_state", "__ai_request", "__ai_result_spec"};
   const ObObjType hidden_types[3] = {ObIntType, ObVarcharType, ObVarcharType};
   const ObString col_name = ai_column.get_column_name_str();
+  char ai_meta_buf[8192];
+  int64_t ai_meta_pos = 0;
+  ObAiColumnMeta ai_column_meta;
+  if (OB_FAIL(ObAiColumnMeta::unpack(ai_column.get_ai_column_meta(), ai_column_meta))) {
+    SQL_RESV_LOG(WARN, "unpack ai column meta failed", K(ret));
+  } else if (OB_FAIL(databuff_printf(ai_meta_buf, sizeof(ai_meta_buf), ai_meta_pos,
+                                     "%.*s [AI_DEPS]%.*s [AI_MAX_RETRIES]%ld",
+                                     ai_column_meta.normalized_expr_.length(),
+                                     ai_column_meta.normalized_expr_.ptr(),
+                                     ai_column_meta.deps_.length(),
+                                     ai_column_meta.deps_.ptr(),
+                                     ai_column_meta.max_retries_))) {
+    SQL_RESV_LOG(WARN, "build ai hidden column comment failed", K(ret));
+  }
+  ObString ai_meta_comment(static_cast<int32_t>(ai_meta_pos), ai_meta_buf);
   if (OB_ISNULL(alter_table_stmt)) {
     ret = OB_INVALID_ARGUMENT;
   } else {
@@ -3507,6 +3522,8 @@ int ObAlterTableResolver::append_ai_hidden_columns_for_add(
         if (OB_FAIL(hidden_col.set_column_name(
                     ObString(static_cast<int32_t>(pos), name_buf)))) {
           SQL_RESV_LOG(WARN, "set ai hidden column name failed", K(ret));
+        } else if (OB_FAIL(hidden_col.set_comment(ai_meta_comment))) {
+          SQL_RESV_LOG(WARN, "set ai hidden column comment failed", K(ret));
         } else if (OB_FAIL(alter_table_stmt->add_column(hidden_col))) {
           SQL_RESV_LOG(WARN, "add ai hidden alter column failed", K(ret));
         }

@@ -1895,11 +1895,11 @@ int ObTableModifyOp::handle_ai_column_row_processing()
         const bool is_pk_update = upd_ctdef->das_base_ctdef_.is_update_pk_;
         const bool row_changed = (NULL != node.full_row_) || is_pk_update;
         common::ObSEArray<AIColumnInfo, 4> invalidated_infos;
-        if (!row_changed) {
-          // The row was not changed (only locked), nothing was written, so the old
-          // AI result stays valid.
-          LOG_INFO("ai col upd row unchanged, skip invalidation");
-        } else {
+        // Do not gate on row_changed: an explicit assignment of an AI result column
+        // (e.g. ALTER TABLE ... RETRY AI COLUMN rewrites "<col> = NULL") is a
+        // regeneration request even when the stored value is already NULL, and the
+        // resolver's implicit invalidation also shows up in updated_column_ids_.
+        {
           const ObChunkDatumStore::StoredRow *old_stored = node.old_row_;
           const ObChunkDatumStore::StoredRow *new_stored = node.new_row_;
           if (NULL == old_stored) {

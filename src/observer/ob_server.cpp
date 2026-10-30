@@ -29,6 +29,7 @@
 #include <thread>
 #include <cstdio>
 #include "observer/ob_server.h"
+#include "observer/ob_ai_column_worker.h"
 #include "observer/ob_system_package_load_service.h"
 #include "rootserver/ob_ddl_service_launcher.h"
 #include "share/ob_autoincrement_service.h"
@@ -1347,6 +1348,14 @@ int ObServer::start()
     // with _Exit(0), which would turn a failed bootstrap into a false success.
     set_stop();
   } else if (!stop_) {
+    {
+      const int worker_ret = start_ai_column_worker(&sql_proxy_);
+      if (OB_SUCCESS != worker_ret) {
+        LOG_ERROR("fail to start ai column async worker", KR(worker_ret));
+      } else {
+        FLOG_INFO("success to start ai column async worker");
+      }
+    }
     GCTX.status_ = SS_SERVING;
     GCTX.start_service_time_ = start_service_time;
     FLOG_INFO("[OBSERVER_NOTICE] observer start service", "start_service_time", GCTX.start_service_time_);
@@ -1553,6 +1562,11 @@ int ObServer::stop()
   int fail_ret = OB_SUCCESS;
   FLOG_INFO("[OBSERVER_NOTICE] stop observer begin");
   LOG_DBA_INFO_V2(OB_SERVER_STOP_BEGIN, "observer stop begin.");
+
+  // Stop the AI column worker before the inner SQL proxy goes away.
+  FLOG_INFO("begin to stop ai column async worker");
+  stop_ai_column_worker();
+  FLOG_INFO("ai column async worker stopped");
 
   if (in_process_) {
     // DDL retries must observe cancellation while schema and SQL services are still available.

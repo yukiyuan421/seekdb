@@ -39,6 +39,7 @@ OBSERVER_UNITY_GROUPS = [
             "src/observer/ob_internal_table_refresh_adapter.cpp",
             "src/observer/ob_ls_runtime_adapter.cpp",
             "src/observer/ob_req_time_service.cpp",
+            "src/observer/ob_ai_column_worker.cpp",
             "src/observer/ob_server_reload_config.cpp",
             "src/observer/ob_server_schema_updater.cpp",
             "src/observer/ob_server_utils.cpp",

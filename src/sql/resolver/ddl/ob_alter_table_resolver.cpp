@@ -16,6 +16,7 @@
 
 #define USING_LOG_PREFIX SQL_RESV
 #include "config_bridge.h"
+#include <strings.h>
 #include "sql/resolver/ddl/ob_alter_table_resolver.h"
 #include "sql/resolver/expr/ob_raw_expr_part_expr_checker.h"
 #include "sql/resolver/dml/ob_delete_resolver.h"
@@ -588,6 +589,11 @@ int ObAlterTableResolver::resolve_action_list(const ParseNode &node)
             }
             break;
         }
+        case T_AI_COLUMN_RETRY: {
+          if (OB_FAIL(resolve_ai_column_retry(*action_node))) {
+          }
+          break;
+        }
         default: {
             ret = OB_ERR_UNEXPECTED;
             SQL_RESV_LOG(WARN, "Unknown alter table action %d", K_(action_node->type), K(ret));
@@ -745,6 +751,12 @@ int ObAlterTableResolver::resolve_action_list(const ParseNode &node)
       }
     }
     } // end for heap_vars_2.
+  }
+  if (OB_SUCC(ret) && OB_NOT_NULL(get_alter_table_stmt())
+      && get_alter_table_stmt()->is_ai_column_retry()
+      && get_alter_table_stmt()->get_alter_table_action_count() > 1) {
+    ret = OB_NOT_SUPPORTED;
+    LOG_USER_ERROR(OB_NOT_SUPPORTED, "combining AI COLUMN RETRY with another ALTER action");
   }
   return ret;
 }
@@ -4564,6 +4576,213 @@ int ObAlterTableResolver::check_semistruct_encoding_type(const ObTableSchema &or
   } else {
     ret = OB_NOT_SUPPORTED;
     LOG_USER_ERROR(OB_NOT_SUPPORTED, "semistruct encoding is not supported");
+  }
+  return ret;
+}
+
+namespace {
+
+// Rewrite the retry-only STATUS pseudo column into an expression over the
+// hidden AI state column / the AI result column. Backtick-quoted identifiers
+// are copied verbatim (that is the physical status column of the table).
+//
+// Hidden state encoding (owned by the async worker / DML hook):
+//   0 = READY, 1 = PENDING, 3 = RETRYING, 4 = FAILED
+void ai_retry_rewrite_status(const common::ObString &predicate,
+                             const common::ObString &result_col,
+                             const common::ObString &state_col,
+                             common::ObSqlString &out)
+{
+  const char *p = predicate.ptr();
+  const int64_t len = predicate.length();
+  int64_t i = 0;
+  while (i < len) {
+    const char c = p[i];
+    if ('\'' == c) {
+      int64_t j = i + 1;
+      while (j < len) {
+        if ('\\' == p[j] && j + 1 < len) {
+          j += 2;
+        } else if ('\'' == p[j]) {
+          if (j + 1 < len && '\'' == p[j + 1]) {
+            j += 2;
+          } else {
+            ++j;
+            break;
+          }
+        } else {
+          ++j;
+        }
+      }
+      out.append(p + i, j - i);
+      i = j;
+    } else if ('`' == c) {
+      int64_t j = i + 1;
+      while (j < len && '`' != p[j]) {
+        ++j;
+      }
+      if (j < len) {
+        ++j;
+      }
+      out.append(p + i, j - i);
+      i = j;
+    } else if (('_' == c) || ((c >= 'a') && (c <= 'z')) || ((c >= 'A') && (c <= 'Z'))) {
+      int64_t j = i;
+      while (j < len && (('_' == p[j]) || ('$' == p[j])
+                         || ((p[j] >= 'a') && (p[j] <= 'z'))
+                         || ((p[j] >= 'A') && (p[j] <= 'Z'))
+                         || ((p[j] >= '0') && (p[j] <= '9')))) {
+        ++j;
+      }
+      const bool is_status = (6 == (j - i)) && (0 == strncasecmp(p + i, "status", 6));
+      if (is_status) {
+        if (!state_col.empty()) {
+          out.append_fmt("(CASE WHEN `%.*s` = 0 THEN 'READY'"
+                         " WHEN `%.*s` = 4 THEN 'FAILED'"
+                         " WHEN `%.*s` = 3 THEN 'RETRYING'"
+                         " WHEN `%.*s` = 1 THEN 'PENDING'"
+                         " WHEN `%.*s` IS NULL AND `%.*s` IS NOT NULL THEN 'READY'"
+                         " ELSE 'FAILED' END)",
+                         static_cast<int>(state_col.length()), state_col.ptr(),
+                         static_cast<int>(state_col.length()), state_col.ptr(),
+                         static_cast<int>(state_col.length()), state_col.ptr(),
+                         static_cast<int>(state_col.length()), state_col.ptr(),
+                         static_cast<int>(state_col.length()), state_col.ptr(),
+                         static_cast<int>(result_col.length()), result_col.ptr());
+        } else {
+          out.append_fmt("(CASE WHEN `%.*s` IS NOT NULL THEN 'READY' ELSE 'FAILED' END)",
+                         static_cast<int>(result_col.length()), result_col.ptr());
+        }
+      } else {
+        out.append(p + i, j - i);
+      }
+      i = j;
+    } else {
+      out.append(p + i, 1);
+      ++i;
+    }
+  }
+}
+
+// Fetch the hidden state column name of an AI column ("<col>__ai_state").
+void ai_retry_get_state_column(const share::schema::ObTableSchema &table,
+                               const common::ObString &result_col,
+                               common::ObString &state_col)
+{
+  state_col.reset();
+  const char suffix[] = "__ai_state";
+  const int64_t suffix_len = static_cast<int64_t>(sizeof(suffix) - 1);
+  char name_buf[common::OB_MAX_COLUMN_NAME_LENGTH + 32];
+  int64_t name_pos = 0;
+  if (result_col.length() + suffix_len < static_cast<int64_t>(sizeof(name_buf))
+      && OB_SUCCESS == databuff_printf(name_buf, sizeof(name_buf), name_pos, "%.*s%s",
+                                       static_cast<int>(result_col.length()),
+                                       result_col.ptr(), suffix)) {
+    const share::schema::ObColumnSchemaV2 *state =
+        table.get_column_schema(common::ObString(static_cast<int32_t>(name_pos), name_buf));
+    if (NULL != state) {
+      state_col.assign_ptr(state->get_column_name_str().ptr(),
+                           state->get_column_name_str().length());
+    }
+  }
+}
+
+}  // namespace
+
+int ObAlterTableResolver::resolve_ai_column_retry(const ParseNode &action_node)
+{
+  int ret = OB_SUCCESS;
+  ObAlterTableStmt *alter_table_stmt = get_alter_table_stmt();
+  const ParseNode *column_node = NULL;
+  const ParseNode *where_node = NULL;
+  if (OB_ISNULL(alter_table_stmt)
+      || OB_UNLIKELY(2 != action_node.num_child_)
+      || OB_ISNULL(action_node.children_)) {
+    ret = OB_ERR_UNEXPECTED;
+    SQL_RESV_LOG(WARN, "invalid retry ai column parse tree", K(ret));
+  } else if (OB_ISNULL(column_node = action_node.children_[0])
+             || OB_ISNULL(column_node->str_value_)) {
+    ret = OB_ERR_UNEXPECTED;
+  } else if (OB_ISNULL(table_schema_)) {
+    ret = OB_ERR_UNEXPECTED;
+  } else {
+    where_node = action_node.children_[1];
+    const common::ObString column_name(column_node->str_len_, column_node->str_value_);
+    const share::schema::ObColumnSchemaV2 *ai_col =
+        table_schema_->get_column_schema(column_name);
+    if (OB_ISNULL(ai_col) || !ai_col->is_ai_column()) {
+      ret = OB_NOT_SUPPORTED;
+      LOG_USER_ERROR(OB_NOT_SUPPORTED, "retrying a column that is not an AI column");
+    } else {
+      // 1. extract the raw predicate text from the original query string
+      common::ObString predicate;
+      if (NULL != where_node) {
+        const common::ObString &sql_text = !params_.cur_sql_.empty()
+                                               ? params_.cur_sql_
+                                               : session_info_->get_current_query_string();
+        const auto &loc = action_node.stmt_loc_;
+        int64_t start = loc.first_column_ - 1;
+        const int64_t end = loc.last_column_ - 1;
+        if (loc.first_column_ <= 0 || loc.last_column_ < loc.first_column_
+            || end >= sql_text.length()) {
+          ret = OB_ERR_UNEXPECTED;
+          SQL_RESV_LOG(WARN, "invalid retry ai column where location", K(ret),
+                       K(loc.first_column_), K(loc.last_column_), K(sql_text.length()));
+        } else {
+          start += 5;  // skip the WHERE keyword
+          while (start <= end && ((' ' == sql_text[start]) || ('\t' == sql_text[start])
+                                  || ('\n' == sql_text[start]) || ('\r' == sql_text[start]))) {
+            ++start;
+          }
+          if (start > end) {
+            ret = OB_ERR_UNEXPECTED;
+          } else {
+            predicate.assign_ptr(sql_text.ptr() + start,
+                                 static_cast<int32_t>(end - start + 1));
+          }
+        }
+      }
+      // 2. build the invalidation statement. The DML hook of the AI column
+      //    machinery turns the "set the AI column to NULL" update into
+      //    "invalidate the generated value + enqueue one task".
+      const common::ObString result_col_name = ai_col->get_column_name_str();
+      common::ObString state_col_name;
+      ai_retry_get_state_column(*table_schema_, result_col_name, state_col_name);
+      common::ObSqlString mapped_predicate;
+      if (OB_SUCC(ret) && NULL != where_node) {
+        ai_retry_rewrite_status(predicate, result_col_name, state_col_name,
+                                mapped_predicate);
+      }
+      const share::schema::ObDatabaseSchema *db_schema = NULL;
+      if (OB_SUCC(ret) && OB_FAIL(schema_checker_->get_database_schema(
+                                     table_schema_->get_database_id(), db_schema))) {
+      } else if (OB_SUCC(ret) && OB_ISNULL(db_schema)) {
+        ret = OB_ERR_UNEXPECTED;
+      }
+      if (OB_SUCC(ret)) {
+        const common::ObString db_name = db_schema->get_database_name_str();
+        const common::ObString table_name = table_schema_->get_table_name_str();
+        common::ObSqlString update_sql;
+        if (OB_FAIL(update_sql.append_fmt("UPDATE `%.*s`.`%.*s` SET `%.*s` = NULL",
+                                          static_cast<int>(db_name.length()), db_name.ptr(),
+                                          static_cast<int>(table_name.length()),
+                                          table_name.ptr(),
+                                          static_cast<int>(result_col_name.length()),
+                                          result_col_name.ptr()))) {
+        } else if (NULL != where_node && mapped_predicate.length() > 0
+                   && OB_FAIL(update_sql.append_fmt(" WHERE %s", mapped_predicate.ptr()))) {
+        } else if (OB_FAIL(alter_table_stmt->set_ai_column_retry_info(
+                       static_cast<int64_t>(table_schema_->get_table_id()),
+                       static_cast<int64_t>(ai_col->get_column_id()),
+                       update_sql.string()))) {
+        } else {
+          alter_table_stmt->set_ai_column_retry(true);
+          SQL_RESV_LOG(INFO, "resolved retry ai column", K(ret),
+                       K(table_schema_->get_table_id()), K(result_col_name),
+                       "update_sql", update_sql.ptr());
+        }
+      }
+    }
   }
   return ret;
 }

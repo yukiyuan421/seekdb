@@ -95,12 +95,23 @@
 #include "sql/resolver/dcl/ob_alter_role_resolver.h"
 #include "sql/pl/ob_pl_package.h"
 
+#include "common/mysqlclient/ob_mysql_proxy.h"
+#include "common/mysqlclient/ob_mysql_result.h"
+#include "share/schema/ob_schema_struct.h"
+#include "share/schema/ob_table_schema.h"
+#include "share/system_variable/ob_sys_var_class_type.h"
+#include "sql/resolver/dml/ob_dml_stmt.h"
+
 namespace oceanbase
 {
 using namespace common;
 using namespace share;
 namespace sql
 {
+
+namespace {
+int check_ai_column_strict_read(ObResolverParams &params, ObStmt *stmt);
+}  // namespace
 ObResolver::ObResolver(ObResolverParams &params)
     : params_(params)
 {
@@ -679,8 +690,203 @@ int ObResolver::resolve(IsPrepared if_prepared, const ParseNode &parse_tree, ObS
       }
     }
   }  // end if
+  if (OB_SUCC(ret) && OB_FAIL(check_ai_column_strict_read(params_, stmt))) {
+    LOG_WARN("ai column strict read check failed", K(ret));
+  }
   return ret;
 }
+
+namespace {
+
+struct ObAiColumnStrictRef
+{
+  uint64_t table_id_;
+  uint64_t column_id_;
+};
+
+// The strict read check runs internal SQL, whose plan resolution must not be
+// checked again by this very function.
+thread_local bool g_ai_column_strict_checking = false;
+
+int collect_ai_column_strict_refs(ObSchemaChecker &schema_checker,
+                                  const ObDMLStmt &stmt,
+                                  common::ObIArray<ObAiColumnStrictRef> &refs)
+{
+  int ret = OB_SUCCESS;
+  const common::ObIArray<ColumnItem> &column_items = stmt.get_column_items();
+  for (int64_t i = 0; OB_SUCC(ret) && i < column_items.count(); ++i) {
+    const ColumnItem &item = column_items.at(i);
+    const share::schema::ObTableSchema *table_schema = NULL;
+    // ColumnItem::table_id_ / the column reference expr of a resolved select
+    // item are not always the base table id (the optimizer sentinels are
+    // OB_INVALID_ID - 1 / OB_INVALID_ID - 2). base_tid_ / base_cid_ are the
+    // base table coordinates and are preferred here.
+    const ObColumnRefRawExpr *col_ref = item.expr_;
+    uint64_t table_id = item.base_tid_;
+    uint64_t column_id = item.base_cid_;
+    if (common::OB_INVALID_ID - 10 <= table_id || 0 == table_id) {
+      table_id = (NULL != col_ref) ? col_ref->get_table_id() : item.table_id_;
+    }
+    if (common::OB_INVALID_ID - 10 <= column_id || 0 == column_id) {
+      column_id = (NULL != col_ref) ? col_ref->get_column_id() : item.column_id_;
+    }
+    if (common::OB_INVALID_ID - 10 <= table_id || 0 == table_id
+        || common::OB_INVALID_ID - 10 <= column_id || 0 == column_id) {
+      continue;
+    } else if (OB_FAIL(schema_checker.get_table_schema(table_id, table_schema))) {
+      // Never let the strict check break a statement whose table cannot be
+      // resolved through this schema checker.
+      SQL_RESV_LOG(WARN, "ai strict collect get table schema failed", K(ret),
+                   K(table_id), K(column_id));
+      ret = OB_SUCCESS;
+      continue;
+    } else if (OB_ISNULL(table_schema)) {
+      continue;
+    } else {
+      const share::schema::ObColumnSchemaV2 *column_schema =
+          table_schema->get_column_schema(column_id);
+      if (NULL != column_schema && column_schema->is_ai_column()) {
+        bool exists = false;
+        for (int64_t j = 0; !exists && j < refs.count(); ++j) {
+          exists = (refs.at(j).table_id_ == table_id
+                    && refs.at(j).column_id_ == column_id);
+        }
+        if (!exists) {
+          ObAiColumnStrictRef ref;
+          ref.table_id_ = table_id;
+          ref.column_id_ = column_id;
+          if (OB_FAIL(refs.push_back(ref))) {
+          }
+        }
+      }
+    }
+  }
+  if (OB_SUCC(ret)) {
+    common::ObSEArray<ObSelectStmt *, 4> child_stmts;
+    if (OB_FAIL(stmt.get_child_stmts(child_stmts))) {
+    }
+    for (int64_t i = 0; OB_SUCC(ret) && i < child_stmts.count(); ++i) {
+      if (OB_ISNULL(child_stmts.at(i))) {
+        ret = OB_ERR_UNEXPECTED;
+      } else if (OB_FAIL(SMART_CALL(collect_ai_column_strict_refs(
+                     schema_checker, *child_stmts.at(i), refs)))) {
+      }
+    }
+  }
+  return ret;
+}
+
+// Column-wide check: as soon as any row of the referenced AI column still
+// misses its generated value the statement is rejected. Which rows the
+// statement itself would select does not matter.
+int check_one_ai_column_strict_ref(ObSchemaChecker &schema_checker,
+                                   common::ObMySQLProxy &sql_proxy,
+                                   const ObAiColumnStrictRef &ref)
+{
+  int ret = OB_SUCCESS;
+  const share::schema::ObTableSchema *table_schema = NULL;
+  const share::schema::ObDatabaseSchema *db_schema = NULL;
+  const share::schema::ObColumnSchemaV2 *column_schema = NULL;
+  if (OB_FAIL(schema_checker.get_table_schema(ref.table_id_, table_schema))) {
+  } else if (OB_ISNULL(table_schema)) {
+    ret = OB_ERR_UNEXPECTED;
+  } else if (OB_ISNULL(column_schema = table_schema->get_column_schema(ref.column_id_))) {
+    ret = OB_ERR_UNEXPECTED;
+  } else if (OB_FAIL(schema_checker.get_database_schema(
+                 table_schema->get_database_id(), db_schema))) {
+  } else if (OB_ISNULL(db_schema)) {
+    ret = OB_ERR_UNEXPECTED;
+  } else {
+    const common::ObString db_name = db_schema->get_database_name_str();
+    const common::ObString table_name = table_schema->get_table_name_str();
+    const common::ObString column_name = column_schema->get_column_name_str();
+    common::ObSqlString sql;
+    if (OB_FAIL(sql.append_fmt(
+            "SELECT 1 FROM `%.*s`.`%.*s` WHERE `%.*s` IS NULL LIMIT 1",
+            static_cast<int>(db_name.length()), db_name.ptr(),
+            static_cast<int>(table_name.length()), table_name.ptr(),
+            static_cast<int>(column_name.length()), column_name.ptr()))) {
+    } else {
+      common::ObMySQLProxy::MySQLResult result;
+      if (OB_FAIL(sql_proxy.read(result, sql.ptr()))) {
+        // The nested probe is best effort: a failure here must not turn a
+        // normal user query into an internal error.
+        SQL_RESV_LOG(WARN, "ai column strict read probe failed, skipped", K(ret),
+                     "sql", sql.ptr());
+        ret = OB_SUCCESS;
+      } else if (OB_ISNULL(result.get_result())) {
+        ret = OB_ERR_UNEXPECTED;
+      } else {
+        const int next_ret = result.get_result()->next();
+        if (OB_ITER_END == next_ret) {
+          // every row of this AI column carries a generated value
+        } else if (OB_SUCCESS == next_ret) {
+          ret = OB_ERR_AI_COLUMN_NOT_READY;
+          LOG_USER_ERROR(OB_ERR_AI_COLUMN_NOT_READY,
+                         static_cast<int64_t>(ref.table_id_),
+                         static_cast<int64_t>(ref.column_id_));
+        } else {
+          ret = next_ret;
+        }
+        const int close_ret = result.get_result()->close();
+        if (OB_SUCC(ret) && OB_SUCCESS != close_ret) {
+          ret = close_ret;
+        }
+      }
+    }
+  }
+  return ret;
+}
+
+int do_check_ai_column_strict_read(ObResolverParams &params, ObStmt &stmt)
+{
+  int ret = OB_SUCCESS;
+  common::ObSEArray<ObAiColumnStrictRef, 4> refs;
+  if (OB_ISNULL(params.schema_checker_) || OB_ISNULL(params.sql_proxy_)) {
+    ret = OB_ERR_UNEXPECTED;
+  } else if (OB_FAIL(collect_ai_column_strict_refs(
+                 *params.schema_checker_, static_cast<const ObDMLStmt &>(stmt), refs))) {
+  }
+  for (int64_t i = 0; OB_SUCC(ret) && i < refs.count(); ++i) {
+    if (OB_FAIL(check_one_ai_column_strict_ref(*params.schema_checker_,
+                                               *params.sql_proxy_, refs.at(i)))) {
+      if (OB_ERR_AI_COLUMN_NOT_READY == ret) {
+        SQL_RESV_LOG(INFO, "ai column strict read rejected", K(ret),
+                     "table_id", refs.at(i).table_id_,
+                     "column_id", refs.at(i).column_id_);
+      }
+    } else {
+      SQL_RESV_LOG(DEBUG, "ai column strict read passed", "table_id",
+                   refs.at(i).table_id_, "column_id", refs.at(i).column_id_);
+    }
+  }
+  return ret;
+}
+
+int check_ai_column_strict_read(ObResolverParams &params, ObStmt *stmt)
+{
+  int ret = OB_SUCCESS;
+  bool strict_read = false;
+  // Disabled (the default) must be a zero-cost no-op.
+  if (OB_ISNULL(params.session_info_)) {
+  } else if (OB_FAIL(params.session_info_->get_sys_variable(
+                 share::SYS_VAR_AI_COLUMN_STRICT_READ, strict_read))) {
+  } else if (!strict_read) {
+  } else if (OB_ISNULL(stmt) || OB_ISNULL(params.schema_checker_)
+             || OB_ISNULL(params.sql_proxy_)) {
+  } else if (!stmt->is_dml_stmt() || stmt->is_explain_stmt() || !stmt->is_sel_del_upd()) {
+    // only SELECT / UPDATE / DELETE may read generated values
+  } else if (g_ai_column_strict_checking) {
+    // an internal probe query of this checker
+  } else {
+    g_ai_column_strict_checking = true;
+    ret = do_check_ai_column_strict_read(params, *stmt);
+    g_ai_column_strict_checking = false;
+  }
+  return ret;
+}
+
+}  // namespace
 
 }  // namespace sql
 }  // namespace oceanbase

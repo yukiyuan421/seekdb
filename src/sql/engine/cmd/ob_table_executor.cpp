@@ -15,6 +15,7 @@
  */
 
 #define USING_LOG_PREFIX SQL_ENG
+#include "common/mysqlclient/ob_mysql_proxy.h"
 #include "config_bridge.h"
 #include "common/ob_timeout_ctx.h"
 #include "lib/stat/ob_diagnostic_info_guard.h"
@@ -751,6 +752,40 @@ int ObAlterTableExecutor::alter_table_exchange_partition_rpc(obcall::ObExchangeP
   return ret;
 }
 
+namespace {
+
+// ALTER TABLE ... RETRY AI COLUMN <col> [WHERE <pred>]:
+// run the invalidation statement through the observer inner SQL proxy. The
+// DML hook of the AI column machinery turns "set the AI column to NULL" into
+// "invalidate the generated value and enqueue the async task", so the retry
+// statement itself only has to issue that UPDATE.
+int execute_ai_column_retry(ObExecContext &ctx, ObAlterTableStmt &stmt)
+{
+  int ret = OB_SUCCESS;
+  ObSQLSessionInfo *session = ctx.get_my_session();
+  common::ObMySQLProxy *sql_proxy = ctx.get_sql_proxy();
+  const common::ObString update_sql = stmt.get_ai_column_retry_update_sql();
+  if (OB_ISNULL(session) || OB_ISNULL(sql_proxy)) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("ai column retry env not ready", K(ret), KP(session), KP(sql_proxy));
+  } else if (OB_UNLIKELY(update_sql.empty())) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("ai column retry update sql not resolved", K(ret));
+  } else {
+    int64_t affected_rows = 0;
+    if (OB_FAIL(sql_proxy->write(update_sql.ptr(), affected_rows))) {
+      LOG_WARN("ai column retry invalidate failed", K(ret), "sql", update_sql.ptr());
+    } else {
+      LOG_INFO("ai column retry invalidated rows", K(affected_rows),
+               "table_id", stmt.get_ai_column_retry_table_id(),
+               "column_id", stmt.get_ai_column_retry_column_id());
+    }
+  }
+  return ret;
+}
+
+}  // namespace
+
 int ObAlterTableExecutor::execute(ObExecContext &ctx, ObAlterTableStmt &stmt)
 {
   int ret = OB_SUCCESS;
@@ -762,6 +797,10 @@ int ObAlterTableExecutor::execute(ObExecContext &ctx, ObAlterTableStmt &stmt)
   OV (OB_NOT_NULL(task_exec_ctx = GET_SQL_EXECUTOR_CTX(ctx)), OB_NOT_INIT);
   if (OB_FAIL(ret)) {
     // do nothing
+  } else if (stmt.is_ai_column_retry()) {
+    if (OB_FAIL(execute_ai_column_retry(ctx, stmt))) {
+      LOG_WARN("execute alter table retry ai column failed", K(ret));
+    }
   } else if (stmt.is_alter_triggers()) {
     if (stmt.get_tg_arg().trigger_infos_.count() > 0) {
       stmt.get_tg_arg().ddl_stmt_str_ = first_stmt;

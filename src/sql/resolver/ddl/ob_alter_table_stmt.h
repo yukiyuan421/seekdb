@@ -23,6 +23,7 @@
 #include "sql/resolver/ob_stmt_resolver.h"
 #include "common/sql_mode/ob_sql_mode.h"
 #include "lib/hash/ob_placement_hashset.h"
+#include "lib/string/ob_sql_string.h"
 
 namespace oceanbase
 {
@@ -81,6 +82,18 @@ public:
   
   bool has_rename_action() const
   { return alter_table_arg_.has_rename_action(); }
+
+  // ALTER TABLE ... RETRY AI COLUMN <col> [WHERE <pred>]:
+  // the resolver builds the invalidate statement, the executor runs it.
+  bool is_ai_column_retry() const { return is_ai_column_retry_; }
+  void set_ai_column_retry(const bool flag) { is_ai_column_retry_ = flag; }
+  int set_ai_column_retry_info(const int64_t table_id,
+                               const int64_t column_id,
+                               const common::ObString &update_sql);
+  int64_t get_ai_column_retry_table_id() const { return ai_column_retry_table_id_; }
+  int64_t get_ai_column_retry_column_id() const { return ai_column_retry_column_id_; }
+  const common::ObString get_ai_column_retry_update_sql() const
+  { return ai_column_retry_update_sql_.string(); }
   virtual obcall::ObDDLArg &get_ddl_arg() { return alter_table_arg_; }
   common::ObSArray<obcall::ObCreateIndexArg*> &get_index_arg_list() { return index_arg_list_; }
   void set_fts_arg_allocator(common::ObIAllocator *fts_arg_allocator) { fts_arg_allocator_ = fts_arg_allocator; }
@@ -114,6 +127,10 @@ private:
   obcall::ObAlterTriggerArg tg_arg_;
   uint64_t alter_table_action_count_;
   obcall::ObExchangePartitionArg exchange_partition_arg_;
+  bool is_ai_column_retry_;
+  int64_t ai_column_retry_table_id_;
+  int64_t ai_column_retry_column_id_;
+  common::ObSqlString ai_column_retry_update_sql_;
 };
 
 inline int ObAlterTableStmt::set_tz_info_wrap(const common::ObTimeZoneInfoWrap &tz_info_wrap)

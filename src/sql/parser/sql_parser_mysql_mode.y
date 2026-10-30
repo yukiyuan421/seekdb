@@ -14746,6 +14746,12 @@ alter_table_action:
 RETRY AI COLUMN column_name opt_where
 {
   malloc_non_terminal_node($$, result->malloc_pool_, T_AI_COLUMN_RETRY, 2, $4, $5);
+  if (NULL != $5) {
+    // Remember the span of the WHERE clause so the resolver can extract the
+    // predicate text from the original query string.
+    $$->stmt_loc_.first_column_ = @5.first_column;
+    $$->stmt_loc_.last_column_ = @5.last_column;
+  }
 }
 | opt_set table_option_list_space_seperated
 {

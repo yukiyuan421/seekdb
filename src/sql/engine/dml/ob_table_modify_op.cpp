@@ -1272,48 +1272,6 @@ bool table_has_ai_column(const share::schema::ObTableSchema &table)
   return found;
 }
 
-int find_datum(const ObDMLBaseCtDef &ctdef,
-               const ObChunkDatumStore::StoredRow &row,
-               const uint64_t column_id,
-               const common::ObDatum *&datum)
-{
-  int ret = OB_SUCCESS;
-  datum = NULL;
-  for (int64_t i = 0; i < ctdef.column_ids_.count(); ++i) {
-    if (ctdef.column_ids_.at(i) == column_id) {
-      if (OB_UNLIKELY(i >= row.cnt_)) {
-        ret = OB_ERR_UNEXPECTED;
-      } else {
-        datum = &row.cells()[i];
-      }
-      break;
-    }
-  }
-  if (OB_SUCC(ret) && NULL == datum) {
-    ret = OB_ERR_UNEXPECTED;
-  }
-  return ret;
-}
-
-bool datum_changed(const common::ObDatum &old_datum,
-                   const common::ObDatum &new_datum,
-                   const share::schema::ObColumnSchemaV2 &col)
-{
-  bool changed = false;
-  if (old_datum.is_null() != new_datum.is_null()) {
-    changed = true;
-  } else if (old_datum.is_null()) {
-    changed = false;
-  } else if (ob_is_integer_type(col.get_data_type())) {
-    changed = old_datum.get_int() != new_datum.get_int();
-  } else if (ob_is_string_tc(col.get_data_type())) {
-    changed = (old_datum.len_ != new_datum.len_)
-              || (0 != MEMCMP(old_datum.ptr_, new_datum.ptr_, old_datum.len_));
-  } else {
-    changed = true;
-  }
-  return changed;
-}
 } // namespace ai_column_dml_util
 
 bool ObTableModifyOp::dml_table_has_ai_column(const ObDMLBaseCtDef &dml_ctdef)
@@ -1499,19 +1457,6 @@ int ObTableModifyOp::handle_ai_column_row_processing()
     // Insert task rows through the data-plane DML seam. The write joins the
     // caller transaction directly, so it never goes through the SQL layer and
     // therefore cannot disturb the outer statement's transaction state.
-    auto log_update_assign_columns = [&](const ObDMLBaseCtDef &ctdef,
-                                         const ObChunkDatumStore::StoredRow &full_row) -> int {
-      UNUSED(full_row);
-      const ObUpdCtDef *upd_ctdef = static_cast<const ObUpdCtDef *>(&ctdef);
-      LOG_INFO("ai col upd assign columns", K(upd_ctdef->assign_columns_.count()));
-      for (int64_t i = 0; i < upd_ctdef->assign_columns_.count(); ++i) {
-        const ColumnContent &cc = upd_ctdef->assign_columns_.at(i);
-        LOG_INFO("ai col upd assign item", K(i), K(cc.projector_index_),
-                 "name", cc.column_name_.ptr(), "len", cc.column_name_.length());
-      }
-      return OB_SUCCESS;
-    };
-
     // batch task insert through data-plane dml seam
     auto insert_task_rows = [&](const share::schema::ObTableSchema &task_table,
                                 const common::ObIArray<TaskRowValue> &values) -> int {
